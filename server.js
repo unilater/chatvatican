@@ -425,6 +425,14 @@ function countTermMatches(terms, text) {
   return terms.reduce((count, term) => (text.includes(term) ? count + 1 : count), 0);
 }
 
+function countTokenMatches(tokens, text) {
+  if (!text || !Array.isArray(tokens) || tokens.length === 0) {
+    return 0;
+  }
+
+  return tokens.reduce((count, token) => (text.includes(token) ? count + 1 : count), 0);
+}
+
 function buildTextExcerpt(text) {
   const normalizedText = String(text || "").replace(/\s+/g, " ").trim();
 
@@ -480,6 +488,29 @@ function pickRelevantEntities(values, analysis) {
   return filteredItems.length > 0 ? filteredItems : items.slice(0, 4);
 }
 
+function isLowQualityHit(hit) {
+  const id = String(hit?.id || "").trim().toLowerCase();
+  const title = String(hit?.titolo || "").trim();
+  const body = String(hit?.testo_originale || "").trim();
+  const abstract = String(hit?.abstract || "").trim().toLowerCase();
+
+  const emptyCoreContent = title.length === 0 && body.length === 0;
+  const looksLikePlaceholderSummary =
+    abstract.includes("non fornisce informazioni specifiche")
+    || abstract.includes("poco informativo");
+  const syntheticDocId = id.startsWith("documento-");
+
+  if (emptyCoreContent) {
+    return true;
+  }
+
+  if (syntheticDocId && looksLikePlaceholderSummary && title.length < 4) {
+    return true;
+  }
+
+  return false;
+}
+
 async function runSearchQuery(query, limit) {
   const searchResponse = await fetch(SEARCH_INDEX_URL, {
     method: "POST",
@@ -499,7 +530,8 @@ async function runSearchQuery(query, limit) {
   }
 
   const payload = await searchResponse.json();
-  return Array.isArray(payload?.hits) ? payload.hits : [];
+  const hits = Array.isArray(payload?.hits) ? payload.hits : [];
+  return hits.filter((hit) => !isLowQualityHit(hit));
 }
 
 async function runSeedSearchCandidates(searchQuery, analysis, candidateLimit) {
@@ -529,6 +561,31 @@ async function runSeedSearchCandidates(searchQuery, analysis, candidateLimit) {
       merged.push(hit);
 
       if (merged.length >= Math.max(candidateLimit, 15)) {
+        return merged;
+      }
+    }
+  }
+
+  return merged;
+}
+
+function dedupeHitsWithCap(hitGroups, cap) {
+  const merged = [];
+  const seen = new Set();
+
+  for (const resultSet of hitGroups) {
+    for (const hit of resultSet) {
+      const dedupeKey = String(hit?.id || "").trim()
+        || `${normalizeText(hit?.titolo)}|${normalizeText(hit?.data)}|${normalizeText(hit?.fonte)}`;
+
+      if (!dedupeKey || seen.has(dedupeKey)) {
+        continue;
+      }
+
+      seen.add(dedupeKey);
+      merged.push(hit);
+
+      if (merged.length >= cap) {
         return merged;
       }
     }
@@ -641,9 +698,10 @@ function buildEntityAwareSignal(candidateHits, question) {
       ? requiredEntities
       : [...detectedEntities.persone, ...detectedEntities.luoghi, ...detectedEntities.enti];
 
-  const retrievalTerms = uniqueTerms(
-    retrievalSource.flatMap((value) => tokenizeSignificant(normalizeApostrophes(value)))
-  );
+  const retrievalTerms = uniqueTerms([
+    ...questionTerms,
+    ...retrievalSource.flatMap((value) => tokenizeSignificant(normalizeApostrophes(value))),
+  ]).slice(0, 18);
 
   const entityKeywordTerms = retrievalTerms.filter((term) => !questionTerms.includes(term));
 
@@ -684,7 +742,13 @@ function hitMatchesEntity(hit, matcher) {
     return true;
   }
 
-  return matcher.tokens.length > 0 && matcher.tokens.every((token) => mergedText.includes(token));
+  if (matcher.tokens.length === 0) {
+    return false;
+  }
+
+  const matchedTokens = countTokenMatches(matcher.tokens, mergedText);
+  const requiredTokenMatches = Math.max(1, Math.ceil(matcher.tokens.length * 0.6));
+  return matchedTokens >= requiredTokenMatches;
 }
 
 function filterHitsByRequiredEntities(hits, requiredEntities) {
@@ -696,7 +760,8 @@ function filterHitsByRequiredEntities(hits, requiredEntities) {
     return hits;
   }
 
-  return hits.filter((hit) => matchers.every((matcher) => hitMatchesEntity(hit, matcher)));
+  const matchedHits = hits.filter((hit) => matchers.some((matcher) => hitMatchesEntity(hit, matcher)));
+  return matchedHits.length > 0 ? matchedHits : hits;
 }
 
 function buildLiveEntitySignal(candidateHits, analysis, selectedHitIds) {
@@ -871,7 +936,26 @@ function scoreHit(hit, analysis) {
   const sourceText = normalizeText(hit?.fonte);
   const originalText = normalizeText(hit?.testo_originale).slice(0, 5000);
 
+  const entityTokens = uniqueTerms(
+    [...(hit?.persone || []), ...(hit?.luoghi || []), ...(hit?.enti || [])]
+      .flatMap((value) => tokenizeSignificant(normalizeApostrophes(value)))
+  );
+
+  const entityCoverage = analysis.terms.length > 0
+    ? countTokenMatches(analysis.terms, entityTokens.join(" ")) / analysis.terms.length
+    : 0;
+  const titleCoverage = analysis.terms.length > 0
+    ? countTermMatches(analysis.terms, titleText) / analysis.terms.length
+    : 0;
+  const abstractCoverage = analysis.terms.length > 0
+    ? countTermMatches(analysis.terms, abstractText) / analysis.terms.length
+    : 0;
+
   let score = 0;
+  // Hierarchy: entity match first, then title, then abstract/body.
+  score += Math.round(entityCoverage * 100);
+  score += Math.round(titleCoverage * 70);
+  score += Math.round(abstractCoverage * 45);
   score += countTermMatches(analysis.terms, titleText) * 8;
   score += countTermMatches(analysis.terms, peopleText) * 7;
   score += countTermMatches(analysis.terms, placesText) * 7;
@@ -931,10 +1015,33 @@ async function fetchContext(searchQuery, limit) {
   const entitySignal = buildEntityAwareSignal(seedCandidates, searchQuery);
   const retrievalQuery = entitySignal.retrievalTerms.join(" ");
 
-  // Pass 2: run retrieval using only matched saved entities.
-  const candidateHits = retrievalQuery
-    ? await runSearchQuery(retrievalQuery, candidateLimit)
-    : [];
+  // Pass 2: retrieval over composed query + focused term queries to avoid
+  // losing multi-intent requests (e.g. "floreria" + "pizzaballa").
+  const termQueries = uniqueTerms(
+    [...entitySignal.retrievalTerms, ...analysis.terms]
+      .map((term) => String(term || "").trim())
+      .filter((term) => term.length >= 4)
+  ).slice(0, 5);
+
+  const expandedQueries = uniqueTerms([
+    retrievalQuery,
+    ...termQueries,
+  ]).filter(Boolean);
+
+  const perQueryLimit = Math.max(3, Math.ceil(candidateLimit / 2));
+  const queryResults = await Promise.all(
+    expandedQueries.map((q) => runSearchQuery(q, perQueryLimit))
+  );
+
+  const candidateHits = dedupeHitsWithCap(
+    [
+      // Keep seed candidates in the pool to preserve lexical intent coverage.
+      seedCandidates,
+      ...queryResults,
+    ],
+    Math.max(candidateLimit, 18)
+  );
+
   const entityConstrainedHits = filterHitsByRequiredEntities(
     candidateHits,
     entitySignal.requiredEntities || []
@@ -942,7 +1049,9 @@ async function fetchContext(searchQuery, limit) {
 
   const rankingAnalysis = {
     ...analysis,
-    terms: entitySignal.retrievalTerms,
+    terms: (analysis.terms && analysis.terms.length > 0)
+      ? analysis.terms
+      : entitySignal.retrievalTerms,
     retrievalQuery,
   };
 
