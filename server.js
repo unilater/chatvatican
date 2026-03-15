@@ -243,6 +243,12 @@ function tokenizeSignificant(value) {
     .filter((token) => token.length > 2);
 }
 
+// Like tokenizeSignificant but also removes function words/prepositions so only
+// "intent" tokens remain. Used when comparing a user question against entity values.
+function tokenizeIntent(value) {
+  return tokenizeSignificant(value).filter((token) => !ITALIAN_STOP_WORDS.has(token));
+}
+
 function uniqueTerms(values) {
   return [...new Set(values.filter(Boolean))];
 }
@@ -486,7 +492,9 @@ async function runSearchQuery(query, limit) {
 async function runSeedSearchCandidates(searchQuery, analysis, candidateLimit) {
   const rawQuery = String(searchQuery || "").trim();
   const phraseQuery = rawQuery || analysis.retrievalQuery || DEFAULT_SEARCH_QUERY;
-  const tokenQueries = uniqueTerms(tokenizeSignificant(normalizeApostrophes(rawQuery)));
+  // Use intent tokens (stop-word filtered) so prepositions like "sulla" don't
+  // fire useless/noisy stand-alone queries against the search index.
+  const tokenQueries = uniqueTerms(tokenizeIntent(normalizeApostrophes(rawQuery)));
   const allQueries = uniqueTerms([phraseQuery, ...tokenQueries]);
 
   const queryLimit = Math.max(Math.ceil(candidateLimit / 2), 5);
@@ -518,7 +526,9 @@ async function runSeedSearchCandidates(searchQuery, analysis, candidateLimit) {
 
 function buildEntityAwareSignal(candidateHits, question) {
   const questionNormalized = normalizeText(normalizeApostrophes(question));
-  const questionTerms = uniqueTerms(tokenizeSignificant(questionNormalized));
+  // Use intent tokens (stop-word filtered) to avoid prepositions like "sulla"
+  // being matched against entity values and creating false required-entity signals.
+  const questionTerms = uniqueTerms(tokenizeIntent(questionNormalized));
 
   const groups = {
     persone: new Map(),
@@ -879,7 +889,7 @@ function selectRelevantHits(hits, analysis, requestedLimit, options = {}) {
   const positivelyRankedHits = rankedHits.filter((entry) => entry.score > 0);
   const sourceEntries =
     strictPositive || positivelyRankedHits.length > 0 ? positivelyRankedHits : rankedHits;
-  const selectedEntries = sourceEntries.slice(0, Math.min(requestedLimit, MAX_CONTEXT_DOCS));
+  const selectedEntries = sourceEntries.slice(0, requestedLimit);
 
   return {
     hits: selectedEntries.map((entry) => entry.hit),
@@ -949,7 +959,8 @@ async function fetchContext(searchQuery, limit) {
       ...(liveEntitySignal.detectedEntities.enti || []),
     ]),
   };
-  const context = hits.map((hit) => hitToBlock(hit, rankingAnalysis)).join("\n");
+  const contextHits = hits.slice(0, MAX_CONTEXT_DOCS);
+  const context = contextHits.map((hit) => hitToBlock(hit, rankingAnalysis)).join("\n");
 
   return {
     hits,
