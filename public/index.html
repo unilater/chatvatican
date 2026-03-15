@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ChatVatican RAG</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="ambient ambient-a"></div>
+    <div class="ambient ambient-b"></div>
+
+    <main class="app-shell">
+      <section class="header-card reveal">
+        <p class="eyebrow">RAG Console</p>
+        <h1>ChatVatican</h1>
+        <p class="subtitle">Interroga documenti ecclesiali con retrieval + risposta strutturata.</p>
+        <p id="stateStatus" class="status-line">Stato locale: in caricamento...</p>
+      </section>
+
+      <section class="controls-card reveal-delay-1">
+        <label>
+          Limite risultati
+          <input id="limit" type="number" min="1" max="20" value="5" />
+        </label>
+
+        <label>
+          Modello Ollama
+          <input id="model" type="text" value="gemma:7b" />
+        </label>
+
+        <label class="full-width">
+          Prompt template (usa {{context}} e {{question}})
+          <textarea id="promptTemplate" rows="12">Usa solo il contesto seguente.
+
+Contesto:
+{{context}}
+
+Domanda:
+{{question}}
+
+Scrivi la risposta con questa struttura:
+
+Sintesi:
+[3-4 frasi]
+
+Temi principali:
+- ...
+- ...
+- ...
+
+Fonti:
+- ...
+
+Regole:
+- non usare conoscenze esterne
+- non inventare fatti
+- usa solo il contesto fornito</textarea>
+        </label>
+      </section>
+
+      <section id="debugPanel" class="debug-card reveal-delay-2" style="display:none">
+        <details>
+          <summary class="debug-summary"><span id="debugSummaryText">Debug ricerca</span></summary>
+          <div id="debugContent" class="debug-content"></div>
+        </details>
+      </section>
+
+      <section class="chat-card reveal-delay-2">
+        <div id="messages" class="messages" aria-live="polite"></div>
+
+        <form id="chatForm" class="composer">
+          <textarea
+            id="question"
+            rows="3"
+            placeholder="Scrivi una domanda, ad esempio: Che cosa emerge da questi articoli su Papa Leone XIV?"
+            required
+          ></textarea>
+          <p id="searchStatus" class="status-line">Ricerca contesto: inattiva</p>
+          <button id="sendBtn" type="submit">Invia</button>
+        </form>
+      </section>
+    </main>
+
+    <template id="messageTemplate">
+      <article class="message">
+        <p class="role"></p>
+        <div class="content"></div>
+      </article>
+    </template>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
