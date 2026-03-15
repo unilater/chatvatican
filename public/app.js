@@ -46,7 +46,7 @@ if (typeof window.marked?.setOptions === "function") {
 }
 
 function setAssistantContent(contentEl, text) {
-  const value = String(text || "");
+  const value = normalizeReasoningBlocks(String(text || ""));
 
   if (!canRenderMarkdown) {
     contentEl.textContent = value;
@@ -57,6 +57,19 @@ function setAssistantContent(contentEl, text) {
   contentEl.innerHTML = window.DOMPurify.sanitize(rendered, {
     USE_PROFILES: { html: true },
   });
+}
+
+function normalizeReasoningBlocks(text) {
+  let output = String(text || "");
+
+  // Some reasoning models emit hidden-thought blocks using custom tags.
+  // Convert them into visible markdown sections for the chat UI.
+  output = output.replace(/<\s*think\s*>/gi, "\n\n## Ragionamento a step\n");
+  output = output.replace(/<\s*\/\s*think\s*>/gi, "\n\n## Risposta\n");
+  output = output.replace(/<\s*thinking\s*>/gi, "\n\n## Ragionamento a step\n");
+  output = output.replace(/<\s*\/\s*thinking\s*>/gi, "\n\n## Risposta\n");
+
+  return output.trim();
 }
 
 function updateDebugPanel(metadata, hits) {

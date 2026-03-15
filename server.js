@@ -17,6 +17,7 @@ const SEARCH_INDEX_URL =
   "https://search.appnativeitalia.com/indexes/testi_ecclesiali/search";
 const SEARCH_API_KEY = process.env.SEARCH_API_KEY || "";
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
+const OLLAMA_NON_STREAM_TIMEOUT_MS = Number(process.env.OLLAMA_NON_STREAM_TIMEOUT_MS || 90_000);
 
 const DEFAULT_SEARCH_QUERY = process.env.DEFAULT_SEARCH_QUERY || "papa leone";
 const DEFAULT_LIMIT = Number(process.env.DEFAULT_LIMIT || 5);
@@ -41,16 +42,28 @@ Domanda:
 
 Scrivi la risposta con questa struttura:
 
-Sintesi:
+Sintesi iniziale:
 [3-4 frasi]
+
+Passaggi logici:
+1. ...
+2. ...
+3. ...
 
 Temi principali:
 - ...
 - ...
 - ...
 
+Evidenze dal contesto:
+- [fatto] (fonte, data)
+- [fatto] (fonte, data)
+
 Fonti:
 - ...
+
+Conclusione:
+[2-3 frasi]
 
 Regole:
 - non usare conoscenze esterne
@@ -997,7 +1010,7 @@ async function fetchContextCached(searchQuery, limit) {
 }
 
 async function askOllama(prompt, model) {
-  const response = await askOllamaWithTimeout(prompt, model, 30_000);
+  const response = await askOllamaWithTimeout(prompt, model, OLLAMA_NON_STREAM_TIMEOUT_MS);
   return response || "Nessuna risposta dal modello.";
 }
 
