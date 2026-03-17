@@ -32,7 +32,7 @@ const UI_STATE_SCOPE_DEFAULT = "default";
 const SEARCH_PROFILES = {
   testi_ecclesiali: {
     key: "notizie",
-    strictTemporalDisambiguation: false,
+    strictTemporalDisambiguation: true,
     defaultChatMode: "rag",
   },
   bollettino: {
@@ -50,6 +50,17 @@ const AI_INTENT_ENABLED = process.env.AI_INTENT_ENABLED !== "false";
 const AI_INTENT_MODEL = process.env.AI_INTENT_MODEL || AI_ENTITY_MODEL;
 const AI_INTENT_TIMEOUT_MS = Number(process.env.AI_INTENT_TIMEOUT_MS || 2200);
 const AI_INTENT_CACHE_TTL_MS = Number(process.env.AI_INTENT_CACHE_TTL_MS || 45_000);
+const AI_QUERY_REWRITE_ENABLED = process.env.AI_QUERY_REWRITE_ENABLED !== "false";
+const AI_QUERY_REWRITE_MODEL = process.env.AI_QUERY_REWRITE_MODEL || AI_INTENT_MODEL;
+const AI_QUERY_REWRITE_TIMEOUT_MS = Number(process.env.AI_QUERY_REWRITE_TIMEOUT_MS || 2600);
+const AI_QUERY_REWRITE_CACHE_TTL_MS = Number(process.env.AI_QUERY_REWRITE_CACHE_TTL_MS || 60_000);
+const AI_TOPIC_RELATION_ENABLED = process.env.AI_TOPIC_RELATION_ENABLED !== "false";
+const AI_TOPIC_RELATION_MODEL = process.env.AI_TOPIC_RELATION_MODEL || AI_QUERY_REWRITE_MODEL;
+const AI_TOPIC_RELATION_TIMEOUT_MS = Number(process.env.AI_TOPIC_RELATION_TIMEOUT_MS || 1800);
+const AI_TOPIC_RELATION_CACHE_TTL_MS = Number(process.env.AI_TOPIC_RELATION_CACHE_TTL_MS || 60_000);
+const AI_TOPIC_RELATION_CONFIDENCE_THRESHOLD = Number(
+  process.env.AI_TOPIC_RELATION_CONFIDENCE_THRESHOLD || 0.72
+);
 const TEMPORAL_MONTH_TERMS = [
   "gennaio",
   "febbraio",
@@ -64,6 +75,20 @@ const TEMPORAL_MONTH_TERMS = [
   "novembre",
   "dicembre",
 ];
+const MONTH_TO_NUMBER = {
+  gennaio: 1,
+  febbraio: 2,
+  marzo: 3,
+  aprile: 4,
+  maggio: 5,
+  giugno: 6,
+  luglio: 7,
+  agosto: 8,
+  settembre: 9,
+  ottobre: 10,
+  novembre: 11,
+  dicembre: 12,
+};
 const TEMPORAL_REFERENCE_TERMS = [
   "oggi",
   "ieri",
@@ -133,12 +158,11 @@ Regole:
 - usa solo il contesto fornito`;
 const DEFAULT_AGENT_PROMPT_TEMPLATE = `Classifica l'intento di una richiesta utente per preparare ricerca documentale.
 Restituisci SOLO JSON valido con schema:
-{"needsTopic":boolean,"needsTime":boolean,"isTimeSensitive":boolean,"confidence":number}
+{"needsTopic":boolean,"needsTime":boolean,"confidence":number}
 
 Regole:
 - needsTopic=true se il tema richiesto e' troppo vago
 - needsTime=true se manca un riferimento temporale essenziale
-- isTimeSensitive=true se il tipo di domanda dipende dal tempo (eventi, nomine, ordinazioni, aggiornamenti)
 - confidence tra 0 e 1
 - niente testo extra
 
@@ -148,9 +172,73 @@ Storico utente:
 
 Ultima domanda utente:
 {{question}}`;
+const DEFAULT_QUERY_REWRITE_TEMPLATE = `Riscrivi una query utente per ricerca documentale nel database.
+Restituisci SOLO JSON valido con schema:
+{"searchQuery":string,"confidence":number}
+
+Regole:
+- usa solo keyword utili alla ricerca (niente frasi complete)
+- mantieni le entita' principali (persone, eventi, luoghi, enti)
+- se c'e' un papa con numero ordinale, normalizzalo in forma araba (esempio: "Giovanni Paolo II" -> "giovanni paolo 2")
+- se compare "giovanni paolo" senza numero, usa "giovanni paolo 2"
+- conserva e normalizza il riferimento temporale in forma leggibile per ricerca (esempio: "gennaio 2000", "marzo 2000", "2000")
+- se la nuova domanda e' un follow-up temporale, eredita il tema dallo storico recente
+- se la nuova domanda contiene un nuovo riferimento temporale, sostituisci il vecchio riferimento temporale (non sommare mesi o anni diversi)
+- usa nella query finale il riferimento temporale piu' recente espresso nell'ultima domanda utente
+- rimuovi stopword e preposizioni (esempio: "all", "nel", "del", "di", "cosa", "vorrei", "sapere")
+- output in minuscolo
+- confidence tra 0 e 1
+- niente testo extra
+
+Storico utente:
+{{history}}
+
+Ultima domanda utente:
+{{question}}`;
+const DEFAULT_TOPIC_RELATION_TEMPLATE = `Valuta se l'ultima domanda utente e' una continuazione dello stesso argomento della domanda precedente.
+Restituisci SOLO JSON valido con schema:
+{"relation":"same-topic"|"new-topic"|"unclear","confidence":number}
+
+Regole:
+- same-topic: richiesta di approfondimento/chiarimento sullo stesso tema
+- new-topic: cambio argomento netto
+- unclear: dubbio o ambiguita'
+- confidence tra 0 e 1
+- niente testo extra
+
+Domanda utente precedente:
+{{lastQuestion}}
+
+Fonti recenti dell'ultima risposta (se disponibili):
+{{previousSources}}
+
+Ultima domanda utente:
+{{question}}`;
+const DEFAULT_PREVIOUS_ANSWER_FOLLOWUP_TEMPLATE = `Valuta se l'ultima domanda utente e' un follow-up della risposta precedente dell'assistente.
+Restituisci SOLO JSON valido con schema:
+{"isFollowUp":boolean,"confidence":number}
+
+Regole:
+- isFollowUp=true se la nuova domanda chiede dettagli/chiarimenti su contenuti gia' presenti nella risposta precedente
+- isFollowUp=false se la nuova domanda apre un argomento diverso
+- confidence tra 0 e 1
+- niente testo extra
+
+Risposta precedente dell'assistente:
+{{previousAnswer}}
+
+Fonti recenti della risposta precedente (se disponibili):
+{{previousSources}}
+
+Ultima domanda utente:
+{{question}}`;
 const searchCache = new Map();
 const questionAnalysisCache = new Map();
 const intentAnalysisCache = new Map();
+const queryRewriteCache = new Map();
+const topicRelationCache = new Map();
+const followUpFromAnswerCache = new Map();
+const dataFilterabilityCache = new Map();
 const ITALIAN_STOP_WORDS = new Set([
   "a",
   "ad",
@@ -367,9 +455,98 @@ function normalizeApostrophes(value) {
   return String(value || "").replace(/[’']/g, " ");
 }
 
+function toIsoDate(year, month, day) {
+  const y = String(year).padStart(4, "0");
+  const m = String(month).padStart(2, "0");
+  const d = String(day).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function getLastDayOfMonth(year, month) {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+function parseTemporalRange(text) {
+  const raw = String(text || "").trim();
+  const normalized = normalizeText(normalizeApostrophes(raw));
+  if (!raw || !normalized) {
+    return null;
+  }
+
+  const monthYearMatch = normalized.match(
+    /\b(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)\s+(?:del\s+)?((?:19|20)\d{2})\b/
+  );
+  if (monthYearMatch) {
+    const month = MONTH_TO_NUMBER[monthYearMatch[1]];
+    const year = Number(monthYearMatch[2]);
+    const endDay = getLastDayOfMonth(year, month);
+    return {
+      start: toIsoDate(year, month, 1),
+      end: toIsoDate(year, month, endDay),
+      precision: "month",
+    };
+  }
+
+  const slashDateMatch = raw.match(/\b(\d{1,2})[/.\-](\d{1,2})[/.\-]((?:19|20)?\d{2})\b/);
+  if (slashDateMatch) {
+    const day = Number(slashDateMatch[1]);
+    const month = Number(slashDateMatch[2]);
+    let year = Number(slashDateMatch[3]);
+    if (year < 100) {
+      year += year >= 70 ? 1900 : 2000;
+    }
+
+    if (month >= 1 && month <= 12) {
+      const maxDay = getLastDayOfMonth(year, month);
+      if (day >= 1 && day <= maxDay) {
+        const iso = toIsoDate(year, month, day);
+        return { start: iso, end: iso, precision: "day" };
+      }
+    }
+  }
+
+  const yearMatch = raw.match(/\b((?:19|20)\d{2})\b/);
+  if (yearMatch) {
+    const year = Number(yearMatch[1]);
+    return {
+      start: toIsoDate(year, 1, 1),
+      end: toIsoDate(year, 12, 31),
+      precision: "year",
+    };
+  }
+
+  return null;
+}
+
+function buildTemporalFilter(range) {
+  if (!range?.start || !range?.end) {
+    return "";
+  }
+
+  return `data >= \"${range.start}\" AND data <= \"${range.end}\"`;
+}
+
+function isIsoDateString(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "").trim());
+}
+
+function hitInTemporalRange(hit, range) {
+  if (!range?.start || !range?.end) {
+    return true;
+  }
+
+  const hitDate = String(hit?.data || "").trim();
+  if (!isIsoDateString(hitDate)) {
+    return false;
+  }
+
+  return hitDate >= range.start && hitDate <= range.end;
+}
+
 function hasTemporalReference(question) {
   const raw = String(question || "").toLowerCase().trim();
   const normalized = normalizeText(normalizeApostrophes(question));
+  const tokens = new Set(normalized.split(/\s+/).filter(Boolean));
 
   if (!raw || !normalized) {
     return false;
@@ -383,11 +560,11 @@ function hasTemporalReference(question) {
     return true;
   }
 
-  if (TEMPORAL_MONTH_TERMS.some((month) => normalized.includes(month))) {
+  if (TEMPORAL_MONTH_TERMS.some((month) => tokens.has(month))) {
     return true;
   }
 
-  if (TEMPORAL_REFERENCE_TERMS.some((term) => normalized.includes(term))) {
+  if (TEMPORAL_REFERENCE_TERMS.some((term) => tokens.has(term))) {
     return true;
   }
 
@@ -429,7 +606,6 @@ async function inferIntentRequirementsWithAi({ question, history, strictTemporal
     const payload = {
       needsTopic: Boolean(parsed.needsTopic),
       needsTime: Boolean(parsed.needsTime),
-      isTimeSensitive: Boolean(parsed.isTimeSensitive),
       confidence: Number(parsed.confidence || 0),
     };
 
@@ -438,6 +614,61 @@ async function inferIntentRequirementsWithAi({ question, history, strictTemporal
     }
 
     intentAnalysisCache.set(cacheKey, {
+      timestamp: now,
+      payload,
+    });
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function rewriteSearchQueryWithAi({ question, history, previousSources, previousAnswer, promptTemplate }) {
+  if (!AI_QUERY_REWRITE_ENABLED) {
+    return null;
+  }
+
+  const template = String(promptTemplate || DEFAULT_QUERY_REWRITE_TEMPLATE);
+  const historyText = getUserHistoryText(history);
+  const sourcesText = formatPreviousSourcesForPrompt(previousSources);
+  const previousAnswerText = String(previousAnswer || "").trim();
+  const rewriteHistoryText = [
+    historyText,
+    previousAnswerText ? `Risposta assistente precedente:\n${previousAnswerText}` : "",
+    `Fonti recenti:\n${sourcesText}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const cacheSource = [historyText, previousAnswerText, sourcesText, String(question || "").trim()]
+    .filter(Boolean)
+    .join(" ");
+  const cacheKey = `rewrite::${normalizeText(template)}::${normalizeText(cacheSource)}`;
+  const now = Date.now();
+  const cached = queryRewriteCache.get(cacheKey);
+  if (cached && now - cached.timestamp < AI_QUERY_REWRITE_CACHE_TTL_MS) {
+    return cached.payload;
+  }
+
+  const prompt = template
+    .replaceAll("{{history}}", rewriteHistoryText || "(vuoto)")
+    .replaceAll("{{question}}", String(question || "").trim());
+
+  try {
+    const raw = await askOllamaWithTimeout(prompt, AI_QUERY_REWRITE_MODEL, AI_QUERY_REWRITE_TIMEOUT_MS);
+    const parsed = extractJsonObject(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    const searchQuery = String(parsed.searchQuery || "").trim();
+    const confidence = Number(parsed.confidence || 0);
+    const payload = {
+      searchQuery,
+      confidence: Number.isFinite(confidence) ? confidence : 0,
+    };
+
+    queryRewriteCache.set(cacheKey, {
       timestamp: now,
       payload,
     });
@@ -471,7 +702,7 @@ async function getTemporalDisambiguation(question, options = {}) {
 
   const aiReliable = aiIntent && aiIntent.confidence >= 0.6;
   const isTimeSensitiveQuestion = aiReliable
-    ? Boolean(aiIntent.needsTime || aiIntent.isTimeSensitive)
+    ? Boolean(aiIntent.needsTime)
     : ruleTimeSensitive;
 
   if (!isTimeSensitiveQuestion) {
@@ -758,15 +989,19 @@ function getSearchApiKey(indexName) {
   return SEARCH_API_KEY;
 }
 
-async function runSearchQuery(query, limit, searchIndex) {
+async function runSearchQuery(query, limit, searchIndex, options = {}) {
   const searchEndpoint = getSearchEndpoint(searchIndex);
   const apiKey = getSearchApiKey(searchIndex);
+  const normalizedIndex = normalizeSearchIndex(searchIndex);
+  const temporalFilter = buildTemporalFilter(options.temporalRange);
+  const indexDataFilterability = dataFilterabilityCache.get(normalizedIndex);
+  const shouldAttemptServerDateFilter = Boolean(temporalFilter) && indexDataFilterability !== false;
 
   if (!apiKey) {
     throw new Error("SEARCH_API_KEY non configurata per l'indice richiesto");
   }
 
-  const searchResponse = await fetch(searchEndpoint, {
+  let searchResponse = await fetch(searchEndpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -775,20 +1010,55 @@ async function runSearchQuery(query, limit, searchIndex) {
     body: JSON.stringify({
       q: query,
       limit,
+      ...(shouldAttemptServerDateFilter ? { filter: temporalFilter } : {}),
     }),
   });
 
   if (!searchResponse.ok) {
     const text = await searchResponse.text();
-    throw new Error(`Errore search API (${searchResponse.status}): ${text}`);
+    const canFallbackToLocalDateFilter =
+      shouldAttemptServerDateFilter
+      && searchResponse.status === 400
+      && /not filterable/i.test(text)
+      && /\bdata\b/i.test(text);
+
+    if (canFallbackToLocalDateFilter) {
+      dataFilterabilityCache.set(normalizedIndex, false);
+      searchResponse = await fetch(searchEndpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          q: query,
+          limit,
+        }),
+      });
+
+      if (!searchResponse.ok) {
+        const fallbackText = await searchResponse.text();
+        throw new Error(`Errore search API (${searchResponse.status}): ${fallbackText}`);
+      }
+    } else {
+      throw new Error(`Errore search API (${searchResponse.status}): ${text}`);
+    }
+  } else if (shouldAttemptServerDateFilter) {
+    dataFilterabilityCache.set(normalizedIndex, true);
   }
 
   const payload = await searchResponse.json();
   const hits = Array.isArray(payload?.hits) ? payload.hits : [];
-  return hits.filter((hit) => !isLowQualityHit(hit));
+  const qualityHits = hits.filter((hit) => !isLowQualityHit(hit));
+
+  if (!options.temporalRange) {
+    return qualityHits;
+  }
+
+  return qualityHits.filter((hit) => hitInTemporalRange(hit, options.temporalRange));
 }
 
-async function runSeedSearchCandidates(searchQuery, analysis, candidateLimit, searchIndex) {
+async function runSeedSearchCandidates(searchQuery, analysis, candidateLimit, searchIndex, options = {}) {
   const rawQuery = String(searchQuery || "").trim();
   const phraseQuery = rawQuery || analysis.retrievalQuery || DEFAULT_SEARCH_QUERY;
   // Use intent tokens (stop-word filtered) so prepositions like "sulla" don't
@@ -798,7 +1068,7 @@ async function runSeedSearchCandidates(searchQuery, analysis, candidateLimit, se
 
   const queryLimit = Math.max(Math.ceil(candidateLimit / 2), 5);
   const queryResults = await Promise.all(
-    allQueries.map((q) => runSearchQuery(q, queryLimit, searchIndex))
+    allQueries.map((q) => runSearchQuery(q, queryLimit, searchIndex, options))
   );
 
   const merged = [];
@@ -1102,6 +1372,7 @@ function buildLiveEntitySignal(candidateHits, analysis, selectedHitIds) {
 function getDefaultUiState(scope = UI_STATE_SCOPE_DEFAULT) {
   const profile = scope === "bollettini" ? SEARCH_PROFILES.bollettino : SEARCH_PROFILES.testi_ecclesiali;
   return {
+    uiMode: "user",
     limit: DEFAULT_LIMIT,
     model: DEFAULT_MODEL,
     chatMode: profile.defaultChatMode,
@@ -1118,10 +1389,13 @@ async function ensureStorageDir() {
 function sanitizeUiState(rawState, scope = UI_STATE_SCOPE_DEFAULT) {
   const defaults = getDefaultUiState(scope);
   const parsedLimit = Number(rawState?.limit ?? defaults.limit);
+  const parsedUiMode = String(rawState?.uiMode || defaults.uiMode).trim().toLowerCase();
   const parsedChatMode = String(rawState?.chatMode || defaults.chatMode).trim().toLowerCase();
+  const uiMode = parsedUiMode === "admin" ? "admin" : "user";
   const chatMode = parsedChatMode === "rag" ? "rag" : "agent";
 
   return {
+    uiMode,
     limit: Number.isFinite(parsedLimit) ? parsedLimit : defaults.limit,
     model: String(rawState?.model || defaults.model).trim() || defaults.model,
     chatMode,
@@ -1203,6 +1477,7 @@ async function writeUiState(nextState, scope = UI_STATE_SCOPE_DEFAULT) {
 function hitToBlock(hit, analysis) {
   const titolo = hit?.titolo || "(senza titolo)";
   const fonte = hit?.fonte || "(fonte sconosciuta)";
+  const link = hit?.link || "";
   const data = hit?.data || "(data non disponibile)";
   const abstract = hit?.abstract || "(nessun abstract)";
   const tipoDocumento = hit?.tipo_documento ? `Tipo documento: ${hit.tipo_documento}` : "";
@@ -1210,13 +1485,13 @@ function hitToBlock(hit, analysis) {
   const persone = formatEntityList("Persone", pickRelevantEntities(hit?.persone, analysis));
   const luoghi = formatEntityList("Luoghi", pickRelevantEntities(hit?.luoghi, analysis));
   const enti = formatEntityList("Enti", pickRelevantEntities(hit?.enti, analysis));
-  const link = hit?.link ? `Link: ${hit.link}` : "";
   const testoEstratto = buildRelevantExcerpt(hit?.testo_originale, analysis);
   const testo = testoEstratto ? `Testo originale: ${testoEstratto}` : "";
 
   return [
     `Titolo: ${titolo}`,
     `Fonte: ${fonte}`,
+    link ? `Link: ${link}` : "",
     `Data: ${data}`,
     tipoDocumento,
     tipoFonte,
@@ -1225,7 +1500,6 @@ function hitToBlock(hit, analysis) {
     enti,
     `Abstract: ${abstract}`,
     testo,
-    link,
     "---",
   ]
     .filter(Boolean)
@@ -1313,12 +1587,40 @@ function buildPrompt(question, context, promptTemplate) {
     .replaceAll("{{question}}", question);
 }
 
+function buildCanonicalSourceLinks(hits, maxItems = 5) {
+  const urls = uniqueTerms(
+    (Array.isArray(hits) ? hits : [])
+      .map((hit) => String(hit?.link || "").trim())
+      .filter((url) => /^https?:\/\//i.test(url))
+  ).slice(0, maxItems);
+
+  if (urls.length === 0) {
+    return "";
+  }
+
+  return [
+    "",
+    "Fonti (link completi):",
+    ...urls.map((url) => `- ${url}`),
+  ].join("\n");
+}
+
+function appendCanonicalSourceLinks(answer, hits) {
+  const suffix = buildCanonicalSourceLinks(hits);
+  if (!suffix) {
+    return answer;
+  }
+
+  return `${String(answer || "").trim()}\n${suffix}`.trim();
+}
+
 async function fetchContext(searchQuery, limit, searchIndex) {
   if (!getSearchApiKey(searchIndex)) {
     throw new Error("SEARCH_API_KEY non configurata per l'indice richiesto");
   }
 
   const analysis = await analyzeQuestion(searchQuery);
+  const temporalRange = parseTemporalRange(searchQuery);
   const candidateLimit = Math.max(limit, Math.min(limit * SEARCH_CANDIDATE_MULTIPLIER, 15));
 
   // Pass 1: collect candidate documents to discover saved entities in the index.
@@ -1326,7 +1628,8 @@ async function fetchContext(searchQuery, limit, searchIndex) {
     searchQuery,
     analysis,
     candidateLimit,
-    searchIndex
+    searchIndex,
+    { temporalRange }
   );
   const entitySignal = buildEntityAwareSignal(seedCandidates, searchQuery);
   const retrievalQuery = entitySignal.retrievalTerms.join(" ");
@@ -1346,7 +1649,7 @@ async function fetchContext(searchQuery, limit, searchIndex) {
 
   const perQueryLimit = Math.max(3, Math.ceil(candidateLimit / 2));
   const queryResults = await Promise.all(
-    expandedQueries.map((q) => runSearchQuery(q, perQueryLimit, searchIndex))
+    expandedQueries.map((q) => runSearchQuery(q, perQueryLimit, searchIndex, { temporalRange }))
   );
 
   const candidateHits = dedupeHitsWithCap(
@@ -1452,16 +1755,364 @@ function getUserHistoryText(history) {
     .join(" ");
 }
 
-function isTimeSensitiveIntent(text) {
-  const normalized = normalizeText(normalizeApostrophes(text));
-  return /ordinaz/.test(normalized)
-    || /consacraz/.test(normalized)
-    || (/nomin/.test(normalized) && /vescov/.test(normalized));
+function getLastUserQuestion(history) {
+  if (!Array.isArray(history)) {
+    return "";
+  }
+
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const item = history[i];
+    if (String(item?.role || "").toLowerCase() !== "user") {
+      continue;
+    }
+
+    const text = String(item?.content || "").trim();
+    if (text) {
+      return text;
+    }
+  }
+
+  return "";
+}
+
+function getLastAssistantAnswer(history) {
+  if (!Array.isArray(history)) {
+    return "";
+  }
+
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const item = history[i];
+    if (String(item?.role || "").toLowerCase() !== "assistant") {
+      continue;
+    }
+
+    const text = String(item?.content || "").trim();
+    if (text) {
+      return text;
+    }
+  }
+
+  return "";
+}
+
+function formatPreviousSourcesForPrompt(previousSources) {
+  if (!Array.isArray(previousSources) || previousSources.length === 0) {
+    return "(nessuna fonte recente)";
+  }
+
+  const rows = previousSources
+    .slice(0, 6)
+    .map((item) => {
+      const titolo = String(item?.titolo || "").trim();
+      const fonte = String(item?.fonte || "").trim();
+      const data = String(item?.data || "").trim();
+      const link = String(item?.link || "").trim();
+
+      const parts = [titolo, fonte, data, link].filter(Boolean);
+      return parts.length > 0 ? `- ${parts.join(" | ")}` : "";
+    })
+    .filter(Boolean);
+
+  if (rows.length === 0) {
+    return "(nessuna fonte recente)";
+  }
+
+  return rows.join("\n");
+}
+
+function buildSourcesContextText(previousSources) {
+  if (!Array.isArray(previousSources) || previousSources.length === 0) {
+    return "";
+  }
+
+  return previousSources
+    .slice(0, 6)
+    .map((item) => {
+      const titolo = String(item?.titolo || "").trim();
+      const fonte = String(item?.fonte || "").trim();
+      const data = String(item?.data || "").trim();
+      return [titolo, fonte, data].filter(Boolean).join(" ");
+    })
+    .filter(Boolean)
+    .join(" ");
+}
+
+function detectTopicSwitchDirective(question) {
+  const normalized = normalizeText(normalizeApostrophes(question));
+  if (!normalized) {
+    return null;
+  }
+
+  if (/\b(cambio argomento|cambiare argomento|nuovo argomento|cercavo altro|altro argomento)\b/.test(normalized)) {
+    return "new-topic";
+  }
+
+  if (/^(si|sì)\b/.test(normalized) && /\b(argomento|altro|nuovo)\b/.test(normalized)) {
+    return "new-topic";
+  }
+
+  if (/\b(stesso argomento|continua sullo stesso|prosegui sullo stesso|resta sullo stesso)\b/.test(normalized)) {
+    return "same-topic";
+  }
+
+  if (/^(no)\b/.test(normalized) && /\b(continua|stesso|prosegui)\b/.test(normalized)) {
+    return "same-topic";
+  }
+
+  return null;
+}
+
+function stripTopicDirectivePhrases(question) {
+  const normalized = normalizeText(normalizeApostrophes(question));
+  if (!normalized) {
+    return "";
+  }
+
+  return normalized
+    .replace(/\b(si|sì)\s+cambio\s+argomento\b/g, "")
+    .replace(/\b(cambio|cambiare)\s+argomento\b/g, "")
+    .replace(/\bno\s+continua\s+sullo\s+stesso\s+argomento\b/g, "")
+    .replace(/\bcontinua\s+sullo\s+stesso\s+argomento\b/g, "")
+    .replace(/\bstesso\s+argomento\b/g, "")
+    .replace(/\bcercavo\s+altro\b/g, "")
+    .replace(/[,:;]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function shouldAskTopicConfirmation(question, relationPayload, hasAnchor) {
+  if (!hasAnchor || !relationPayload) {
+    return false;
+  }
+
+  const normalized = normalizeText(normalizeApostrophes(question));
+  const shortQuestion = tokenizeIntent(normalized).length <= 7;
+  const vagueFollowUp = /^(e|oppure|allora|quindi|ok|va bene)\b/.test(normalized)
+    || /\b(stesso|quello|quella|li|la|lo)\b/.test(normalized);
+  const lowConfidence = relationPayload.confidence < AI_TOPIC_RELATION_CONFIDENCE_THRESHOLD;
+  const unclear = relationPayload.relation === "unclear";
+
+  return (unclear || lowConfidence) && shortQuestion && (vagueFollowUp || !hasTopicReference(question));
+}
+
+async function inferTopicRelationWithAi({ question, history, previousSources }) {
+  if (!AI_TOPIC_RELATION_ENABLED) {
+    return null;
+  }
+
+  const currentQuestion = String(question || "").trim();
+  const lastQuestion = getLastUserQuestion(history);
+  const previousSourcesText = formatPreviousSourcesForPrompt(previousSources);
+
+  if (!currentQuestion) {
+    return null;
+  }
+
+  const hasConversationAnchor = Boolean(lastQuestion) || previousSourcesText !== "(nessuna fonte recente)";
+  if (!hasConversationAnchor) {
+    return null;
+  }
+
+  const cacheKey = `topic-relation::${normalizeText(lastQuestion)}::${normalizeText(previousSourcesText)}::${normalizeText(currentQuestion)}`;
+  const now = Date.now();
+  const cached = topicRelationCache.get(cacheKey);
+  if (cached && now - cached.timestamp < AI_TOPIC_RELATION_CACHE_TTL_MS) {
+    return cached.payload;
+  }
+
+  const prompt = DEFAULT_TOPIC_RELATION_TEMPLATE
+    .replaceAll("{{lastQuestion}}", lastQuestion || "(nessuna domanda precedente)")
+    .replaceAll("{{previousSources}}", previousSourcesText)
+    .replaceAll("{{question}}", currentQuestion);
+
+  try {
+    const raw = await askOllamaWithTimeout(
+      prompt,
+      AI_TOPIC_RELATION_MODEL,
+      AI_TOPIC_RELATION_TIMEOUT_MS
+    );
+    const parsed = extractJsonObject(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    const relation = String(parsed.relation || "").trim().toLowerCase();
+    const normalizedRelation =
+      relation === "same-topic" || relation === "new-topic" || relation === "unclear"
+        ? relation
+        : "unclear";
+
+    const confidence = Number(parsed.confidence || 0);
+    const payload = {
+      relation: normalizedRelation,
+      confidence: Number.isFinite(confidence) ? confidence : 0,
+    };
+
+    topicRelationCache.set(cacheKey, {
+      timestamp: now,
+      payload,
+    });
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function inferFollowUpFromPreviousAnswerWithAi({ question, history, previousSources }) {
+  const currentQuestion = String(question || "").trim();
+  const previousAnswer = getLastAssistantAnswer(history);
+  if (!currentQuestion || !previousAnswer) {
+    return null;
+  }
+
+  const sourcesText = formatPreviousSourcesForPrompt(previousSources);
+  const cacheKey = `followup-answer::${normalizeText(previousAnswer)}::${normalizeText(sourcesText)}::${normalizeText(currentQuestion)}`;
+  const now = Date.now();
+  const cached = followUpFromAnswerCache.get(cacheKey);
+  if (cached && now - cached.timestamp < AI_TOPIC_RELATION_CACHE_TTL_MS) {
+    return cached.payload;
+  }
+
+  const prompt = DEFAULT_PREVIOUS_ANSWER_FOLLOWUP_TEMPLATE
+    .replaceAll("{{previousAnswer}}", previousAnswer)
+    .replaceAll("{{previousSources}}", sourcesText)
+    .replaceAll("{{question}}", currentQuestion);
+
+  try {
+    const raw = await askOllamaWithTimeout(
+      prompt,
+      AI_TOPIC_RELATION_MODEL,
+      AI_TOPIC_RELATION_TIMEOUT_MS
+    );
+    const parsed = extractJsonObject(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    const confidence = Number(parsed.confidence || 0);
+    const payload = {
+      isFollowUp: Boolean(parsed.isFollowUp),
+      confidence: Number.isFinite(confidence) ? confidence : 0,
+    };
+
+    followUpFromAnswerCache.set(cacheKey, {
+      timestamp: now,
+      payload,
+    });
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function inferFollowUpFromPreviousAnswerRules(question, history) {
+  const currentQuestion = normalizeText(normalizeApostrophes(question));
+  const previousAnswer = normalizeText(normalizeApostrophes(getLastAssistantAnswer(history)));
+  if (!currentQuestion || !previousAnswer) {
+    return false;
+  }
+
+  const questionTokens = uniqueTerms(tokenizeIntent(currentQuestion))
+    .filter((token) => token.length >= 5)
+    .filter((token) => !isTemporalIntentToken(token));
+
+  if (questionTokens.length === 0) {
+    return false;
+  }
+
+  return questionTokens.some((token) => previousAnswer.includes(token));
 }
 
 function hasTopicReference(text) {
-  const intentTerms = tokenizeIntent(normalizeApostrophes(text));
-  return uniqueTerms(intentTerms).length >= 2;
+  const intentTerms = uniqueTerms(tokenizeIntent(normalizeApostrophes(text)));
+  if (intentTerms.length >= 2) {
+    return true;
+  }
+
+  if (intentTerms.length === 1) {
+    return intentTerms[0].length >= 6;
+  }
+
+  return false;
+}
+
+function isTemporalIntentToken(token) {
+  if (!token) {
+    return false;
+  }
+
+  if (/^(19|20)\d{2}$/.test(token)) {
+    return true;
+  }
+
+  if (TEMPORAL_MONTH_TERMS.includes(token)) {
+    return true;
+  }
+
+  if (TEMPORAL_REFERENCE_TERMS.includes(token)) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasNonTemporalTopicOverlap(textA, textB) {
+  const tokensA = uniqueTerms(tokenizeIntent(normalizeApostrophes(textA))).filter(
+    (token) => !isTemporalIntentToken(token)
+  );
+  const tokensB = uniqueTerms(tokenizeIntent(normalizeApostrophes(textB))).filter(
+    (token) => !isTemporalIntentToken(token)
+  );
+
+  if (tokensA.length === 0 || tokensB.length === 0) {
+    return false;
+  }
+
+  const tokenSetB = new Set(tokensB);
+  return tokensA.some((token) => tokenSetB.has(token));
+}
+
+function hasOnlyTemporalIntent(text) {
+  const tokens = uniqueTerms(tokenizeIntent(normalizeApostrophes(text)));
+  if (tokens.length === 0) {
+    return false;
+  }
+
+  return tokens.every((token) => isTemporalIntentToken(token));
+}
+
+function pickAnswerSnippetsFromPreviousAnswer(question, previousAnswer) {
+  const originalAnswer = String(previousAnswer || "").trim();
+  if (!originalAnswer) {
+    return [];
+  }
+
+  const questionTokens = uniqueTerms(tokenizeIntent(normalizeApostrophes(question)))
+    .filter((token) => token.length >= 5)
+    .filter((token) => !isTemporalIntentToken(token));
+
+  if (questionTokens.length === 0) {
+    return [];
+  }
+
+  const sentences = originalAnswer
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const matches = sentences.filter((sentence) => {
+    const normalizedSentence = normalizeText(normalizeApostrophes(sentence));
+    const hasNegation = /\b(non|nessun|nessuna|nessuno|senza)\b/.test(normalizedSentence);
+    if (hasNegation) {
+      return false;
+    }
+
+    return questionTokens.some((token) => normalizedSentence.includes(token));
+  });
+
+  return matches.slice(0, 2);
 }
 
 function buildProposedSearchQuery(text) {
@@ -1469,26 +2120,66 @@ function buildProposedSearchQuery(text) {
   return terms.join(" ");
 }
 
-async function buildIntakeDecision({ question, history, profile, agentPromptTemplate }) {
-  const historyText = getUserHistoryText(history);
-  const mergedText = [historyText, String(question || "").trim()].filter(Boolean).join(" ");
-  const userTurns = (Array.isArray(history)
-    ? history.filter((item) => String(item?.role || "").toLowerCase() === "user").length
-    : 0) + 1;
+async function buildIntakeDecision({ question, history, previousSources, profile, agentPromptTemplate }) {
+  const originalQuestionText = String(question || "").trim();
+  const currentQuestionText = stripTopicDirectivePhrases(originalQuestionText) || originalQuestionText;
+  const explicitDirective = detectTopicSwitchDirective(originalQuestionText);
+  const previousAnswerText = getLastAssistantAnswer(history);
+  const followUpFromAnswer = await inferFollowUpFromPreviousAnswerWithAi({
+    question: currentQuestionText,
+    history,
+    previousSources,
+  });
+
+  // Priority order:
+  // 1) explicit user directive;
+  // 2) semantic follow-up detection against previous assistant answer;
+  // 3) default to new topic.
+  const keepConversationContext = explicitDirective === "same-topic"
+    ? true
+    : explicitDirective === "new-topic"
+      ? false
+      : Boolean(
+        (followUpFromAnswer?.isFollowUp && followUpFromAnswer?.confidence >= 0.6)
+        || inferFollowUpFromPreviousAnswerRules(currentQuestionText, history)
+      );
+
+  // If the requested detail is already present in previous assistant answer,
+  // respond directly from memory and avoid running a new search.
+  if (keepConversationContext && explicitDirective !== "new-topic") {
+    const memorySnippets = pickAnswerSnippetsFromPreviousAnswer(currentQuestionText, previousAnswerText);
+    if (memorySnippets.length > 0) {
+      return {
+        readyToSearch: false,
+        answer: memorySnippets.join(" "),
+        proposedSearchQuery: "",
+        missingFields: [],
+        stage: "answered-from-memory",
+      };
+    }
+  }
+
+  const effectiveHistory = keepConversationContext && Array.isArray(history) ? history : [];
+  const effectiveHistoryText = getUserHistoryText(effectiveHistory);
+  const effectivePreviousAnswerText = keepConversationContext ? previousAnswerText : "";
+  const effectiveSourcesText = keepConversationContext ? buildSourcesContextText(previousSources) : "";
+  const mergedText = [effectiveHistoryText, effectivePreviousAnswerText, effectiveSourcesText, currentQuestionText]
+    .filter(Boolean)
+    .join(" ");
 
   const strictTemporal = Boolean(profile?.strictTemporalDisambiguation);
   const aiIntent = await inferIntentRequirementsWithAi({
     question,
-    history,
+    history: effectiveHistory,
     strictTemporal,
     promptTemplate: agentPromptTemplate,
   });
 
   const aiReliable = aiIntent && aiIntent.confidence >= 0.55;
   const ruleNeedsTopic = !hasTopicReference(mergedText);
-  const ruleNeedsTime = strictTemporal
-    && isTimeSensitiveIntent(mergedText)
-    && !hasTemporalReference(mergedText);
+  const hasTemporalInCurrentQuestion = hasTemporalReference(currentQuestionText);
+  const hasTemporalInMergedContext = hasTemporalReference(mergedText);
+  const ruleNeedsTime = strictTemporal && !hasTemporalInMergedContext;
 
   let needsTopic = ruleNeedsTopic;
   let needsTime = ruleNeedsTime;
@@ -1497,13 +2188,19 @@ async function buildIntakeDecision({ question, history, profile, agentPromptTemp
     needsTopic = Boolean(aiIntent.needsTopic);
 
     if (strictTemporal) {
-      needsTime = Boolean(aiIntent.needsTime || aiIntent.isTimeSensitive) && !hasTemporalReference(mergedText);
+      needsTime = Boolean(aiIntent.needsTime) && !hasTemporalInMergedContext;
     } else {
       needsTime = false;
     }
 
     if (ruleNeedsTopic) {
       needsTopic = true;
+    } else {
+      needsTopic = false;
+    }
+
+    if (ruleNeedsTime) {
+      needsTime = true;
     }
   }
 
@@ -1516,7 +2213,23 @@ async function buildIntakeDecision({ question, history, profile, agentPromptTemp
   }
 
   if (missingFields.length === 0) {
-    const proposedSearchQuery = buildProposedSearchQuery(mergedText);
+    const querySeedText = currentQuestionText;
+    const aiRewrittenQuery = await rewriteSearchQueryWithAi({
+      question: currentQuestionText,
+      history: [],
+      previousSources: [],
+      previousAnswer: "",
+      promptTemplate: DEFAULT_QUERY_REWRITE_TEMPLATE,
+    });
+    const canUseAiRewrite = Boolean(
+      aiRewrittenQuery?.searchQuery
+      && Number(aiRewrittenQuery?.confidence || 0) >= 0.6
+      && hasTopicReference(aiRewrittenQuery.searchQuery)
+    );
+    const proposedSearchQuery =
+      canUseAiRewrite
+      ? aiRewrittenQuery.searchQuery
+      : buildProposedSearchQuery(querySeedText);
     return {
       readyToSearch: Boolean(proposedSearchQuery),
       answer:
@@ -1549,13 +2262,10 @@ async function buildIntakeDecision({ question, history, profile, agentPromptTemp
     };
   }
 
-  const strictTemplate =
-    "Formato rapido: 'ordinazioni di vescovi nel 2025' oppure 'nomine episcopali negli ultimi 12 mesi'.";
-  const softAsk = "Mi manca solo il periodo temporale. Indica anno o intervallo.";
-
   return {
     readyToSearch: false,
-    answer: userTurns >= 3 ? strictTemplate : `${softAsk} ${strictTemplate}`,
+    answer:
+      "Mi manca solo il periodo temporale. Indica anno o intervallo (es: 'gennaio 2000', '2025', 'ultimi 12 mesi').",
     proposedSearchQuery: "",
     missingFields,
     stage: "need-time",
@@ -1655,6 +2365,7 @@ app.post("/api/ui-state", async (req, res) => {
     const currentState = await readUiState(scope);
     const nextState = {
       ...currentState,
+      uiMode: req.body?.uiMode,
       limit: req.body?.limit,
       model: req.body?.model,
       chatMode: req.body?.chatMode,
@@ -1678,6 +2389,7 @@ app.post("/api/intake-chat", async (req, res) => {
     const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
     const profile = getSearchProfile(searchIndex);
     const history = Array.isArray(req.body?.history) ? req.body.history : [];
+    const previousSources = Array.isArray(req.body?.previousSources) ? req.body.previousSources : [];
     const uiScope = profile.key;
     const currentState = await readUiState(uiScope);
 
@@ -1688,6 +2400,7 @@ app.post("/api/intake-chat", async (req, res) => {
     const decision = await buildIntakeDecision({
       question,
       history,
+      previousSources,
       profile,
       agentPromptTemplate: currentState.agentPromptTemplate,
     });
@@ -1849,7 +2562,8 @@ app.post("/api/rag", async (req, res) => {
     }
 
     const prompt = buildPrompt(question, context, promptTemplate);
-    const answer = await askOllama(prompt, model);
+    const rawAnswer = await askOllama(prompt, model);
+    const answer = appendCanonicalSourceLinks(rawAnswer, hits);
 
     return res.json({
       answer,
@@ -1969,6 +2683,11 @@ app.post("/api/rag-stream", async (req, res) => {
     await askOllamaStream(prompt, model, (textChunk) => {
       writeNdjsonEvent(res, { type: "token", text: textChunk });
     });
+
+    const sourceLinksSuffix = buildCanonicalSourceLinks(hits);
+    if (sourceLinksSuffix) {
+      writeNdjsonEvent(res, { type: "token", text: `\n${sourceLinksSuffix}` });
+    }
 
     writeNdjsonEvent(res, { type: "done" });
     return res.end();

@@ -79,6 +79,13 @@ body {
   padding: 1.2rem 1.3rem;
 }
 
+.header-topline {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
 .eyebrow {
   text-transform: uppercase;
   letter-spacing: 0.1em;
@@ -103,6 +110,46 @@ h1 {
   margin: 0.55rem 0 0;
   font-size: 0.84rem;
   color: var(--muted);
+}
+
+.role-switch {
+  display: inline-flex;
+  align-self: flex-start;
+  padding: 0.24rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--line);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
+}
+
+.role-switch-btn {
+  min-width: 5.8rem;
+  border-radius: 999px;
+  padding: 0.5rem 0.9rem;
+  background: transparent;
+  color: var(--muted);
+  box-shadow: none;
+}
+
+.role-switch-btn[aria-pressed="true"] {
+  background: linear-gradient(100deg, var(--accent-2), #1d5961);
+  color: #fff;
+}
+
+.role-switch-btn:hover {
+  filter: none;
+}
+
+body[data-ui-mode="user"] .admin-only {
+  display: none !important;
+}
+
+body[data-ui-mode="user"] .app-shell {
+  max-width: 920px;
+}
+
+body[data-ui-mode="user"] .header-card {
+  padding-bottom: 1rem;
 }
 
 .controls-card {
@@ -298,6 +345,10 @@ button:hover {
 button:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.role-switch-btn:disabled {
+  opacity: 1;
 }
 
 .reveal,
@@ -522,9 +573,83 @@ details[open] .debug-summary::before {
   animation: blink-cursor 750ms step-start infinite;
 }
 
+.message-sources {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--line);
+}
+
+.sources-label {
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--muted);
+  width: 100%;
+  flex-shrink: 0;
+}
+
+.source-link {
+  display: inline-block;
+  font-size: 0.78rem;
+  color: var(--accent-2);
+  text-decoration: none;
+  background: rgba(35, 111, 120, 0.09);
+  border: 1px solid rgba(35, 111, 120, 0.22);
+  border-radius: 999px;
+  padding: 0.22rem 0.72rem;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 140ms;
+}
+
+.source-link:hover {
+  background: rgba(35, 111, 120, 0.18);
+}
+
+.topic-switch-actions {
+  margin-top: 0.8rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--line);
+  display: flex;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+}
+
+.topic-switch-btn {
+  min-width: 10.6rem;
+  border-radius: 999px;
+  padding: 0.45rem 0.8rem;
+  font-size: 0.82rem;
+}
+
+.topic-switch-btn.secondary {
+  background: rgba(35, 111, 120, 0.1);
+  color: var(--accent-2);
+  border: 1px solid rgba(35, 111, 120, 0.28);
+}
+
 @media (max-width: 640px) {
   .app-shell {
     padding: 0.6rem 0.75rem 0;
+  }
+
+  .header-topline {
+    flex-direction: column;
+  }
+
+  .role-switch {
+    width: 100%;
+  }
+
+  .role-switch-btn {
+    flex: 1 1 0;
   }
 
   .chat-card {

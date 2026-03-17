@@ -18,13 +18,26 @@
 
     <main class="app-shell">
       <section class="header-card reveal">
-        <p class="eyebrow">RAG Console</p>
-        <h1>ChatVatican - Bollettini Sala Stampa</h1>
-        <p class="subtitle">Interroga i documenti ufficiali dei bollettini con retrieval + risposta strutturata.</p>
-        <p id="stateStatus" class="status-line">Stato locale: in caricamento...</p>
+        <div class="header-topline">
+          <div>
+            <p class="eyebrow">RAG Console</p>
+            <h1>ChatVatican - Bollettini Sala Stampa</h1>
+            <p class="subtitle">Interroga i documenti ufficiali dei bollettini con retrieval + risposta strutturata.</p>
+          </div>
+
+          <div class="role-switch" aria-label="Selettore vista">
+            <button id="userModeBtn" class="role-switch-btn" type="button" data-ui-mode="user" aria-pressed="false">
+              Utente
+            </button>
+            <button id="adminModeBtn" class="role-switch-btn" type="button" data-ui-mode="admin" aria-pressed="true">
+              Admin
+            </button>
+          </div>
+        </div>
+        <p id="stateStatus" class="status-line admin-only">Stato locale: in caricamento...</p>
       </section>
 
-      <section class="controls-card reveal-delay-1">
+      <section class="controls-card reveal-delay-1 admin-only">
         <label>
           Limite risultati
           <input id="limit" type="number" min="1" max="20" value="5" />
@@ -106,7 +119,7 @@ Ultima domanda utente:
         </label>
       </section>
 
-      <section id="debugPanel" class="debug-card reveal-delay-2" style="display:none">
+      <section id="debugPanel" class="debug-card reveal-delay-2 admin-only" style="display:none">
         <details>
           <summary class="debug-summary"><span id="debugSummaryText">Debug ricerca</span></summary>
           <div id="debugContent" class="debug-content"></div>
@@ -123,7 +136,7 @@ Ultima domanda utente:
             placeholder="Scrivi una domanda, ad esempio: Quali comunicazioni ufficiali emergono dagli ultimi bollettini?"
             required
           ></textarea>
-          <p id="searchStatus" class="status-line">Ricerca contesto: inattiva</p>
+          <p id="searchStatus" class="status-line admin-only">Ricerca contesto: inattiva</p>
           <button id="sendBtn" type="submit">Invia</button>
         </form>
       </section>

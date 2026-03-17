@@ -14,6 +14,8 @@ const messageTemplate = document.getElementById("messageTemplate");
 const debugPanel = document.getElementById("debugPanel");
 const debugSummaryText = document.getElementById("debugSummaryText");
 const debugContent = document.getElementById("debugContent");
+const userModeBtn = document.getElementById("userModeBtn");
+const adminModeBtn = document.getElementById("adminModeBtn");
 const pageConfig = {
   pageKey: window.CHAT_CONFIG?.pageKey || "notizie",
   searchIndex: window.CHAT_CONFIG?.searchIndex || document.body?.dataset?.searchIndex || "testi_ecclesiali",
@@ -30,13 +32,44 @@ const pageConfig = {
 };
 const searchIndex = pageConfig.searchIndex;
 const uiScope = pageConfig.pageKey || "default";
+const DEFAULT_UI_MODE = "user";
 
 let saveTimer;
 let previewTimer;
 let previewSequence = 0;
 let prefetchAbortController;
+let pendingAutoSearchQuery = "";
 const LIVE_PREFETCH_DEBOUNCE_MS = 120;
 const agentTurnHistory = [];
+let lastRagSources = [];
+
+let uiMode = DEFAULT_UI_MODE;
+
+function isAdminMode() {
+  return uiMode === "admin";
+}
+
+function setUiMode(nextMode) {
+  uiMode = nextMode === "admin" ? "admin" : "user";
+  document.body.dataset.uiMode = uiMode;
+
+  if (uiMode === "user") {
+    clearTimeout(previewTimer);
+    if (prefetchAbortController) {
+      prefetchAbortController.abort();
+    }
+  }
+
+  if (userModeBtn) {
+    userModeBtn.setAttribute("aria-pressed", String(uiMode === "user"));
+  }
+
+  if (adminModeBtn) {
+    adminModeBtn.setAttribute("aria-pressed", String(uiMode === "admin"));
+  }
+
+  updateModeUxState();
+}
 
 function isAgentMode() {
   return (chatModeInput?.value || pageConfig.defaultChatMode) === "agent";
@@ -56,6 +89,13 @@ function setQuestionPlaceholder() {
 }
 
 function updateModeUxState() {
+  setQuestionPlaceholder();
+
+  if (!isAdminMode()) {
+    debugPanel.style.display = "none";
+    return;
+  }
+
   if (promptTemplateBlock) {
     promptTemplateBlock.style.display = "grid";
   }
@@ -63,12 +103,10 @@ function updateModeUxState() {
   if (isAgentMode()) {
     setSearchStatus("Modalita' agente: raccolta dati guidata, ricerca disattivata finche' non sei pronto");
     debugPanel.style.display = "none";
-    setQuestionPlaceholder();
     return;
   }
 
   setSearchStatus("Ricerca contesto: inattiva");
-  setQuestionPlaceholder();
 }
 
 function setStateStatus(text) {
@@ -85,6 +123,15 @@ function escapeHtml(str) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function isSafeUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || u.protocol === "http:";
+  } catch {
+    return false;
+  }
 }
 
 const canRenderMarkdown =
@@ -126,6 +173,11 @@ function normalizeReasoningBlocks(text) {
 }
 
 function updateDebugPanel(metadata, hits) {
+  if (!isAdminMode()) {
+    debugPanel.style.display = "none";
+    return;
+  }
+
   const terms = metadata?.queryTerms || [];
   const entityKeywordTerms = metadata?.entityKeywordTerms || [];
   const retrieval = metadata?.retrievalQuery || "";
@@ -237,6 +289,7 @@ function collectUiState() {
     questionDraft: questionInput.value,
     limit: Number(limitInput.value || 5),
     model: modelInput.value.trim(),
+    uiMode,
     chatMode: chatModeInput?.value || "agent",
     promptTemplate: promptTemplateInput.value,
     agentPromptTemplate: agentPromptTemplateInput?.value || "",
@@ -272,11 +325,13 @@ function scheduleUiStateSave() {
 
 async function loadUiState() {
   const state = await fetchJson(`/api/ui-state?scope=${encodeURIComponent(uiScope)}`);
+  setUiMode(state.uiMode || DEFAULT_UI_MODE);
   questionInput.value = state.questionDraft || "";
   limitInput.value = String(state.limit || 5);
   modelInput.value = state.model || "gemma:7b";
   if (chatModeInput) {
-    chatModeInput.value = state.chatMode || pageConfig.defaultChatMode;
+    // For this UX we always enter in agent mode, regardless of persisted state.
+    chatModeInput.value = "agent";
   }
   if (state.promptTemplate) {
     promptTemplateInput.value = state.promptTemplate;
@@ -318,6 +373,10 @@ async function prefetchSearch(question, limit, sequenceId) {
 
 function scheduleSearchPrefetch() {
   clearTimeout(previewTimer);
+
+  if (!isAdminMode()) {
+    return;
+  }
 
   if (isAgentMode()) {
     setSearchStatus("Modalita' agente: raccolta dati attiva, nessuna ricerca automatica");
@@ -512,6 +571,7 @@ chatForm.addEventListener("submit", async (event) => {
   }, 1000);
 
   let streamStarted = false;
+  let assistantFinalText = "";
 
   function stopThinking() {
     if (!streamStarted) {
@@ -530,6 +590,7 @@ chatForm.addEventListener("submit", async (event) => {
         limit,
         model,
         history: agentTurnHistory,
+        previousSources: lastRagSources,
       });
 
       stopThinking();
@@ -537,7 +598,7 @@ chatForm.addEventListener("submit", async (event) => {
 
       agentTurnHistory.push({ role: "user", content: question });
       agentTurnHistory.push({ role: "assistant", content: intakeResponse?.answer || "" });
-      while (agentTurnHistory.length > 12) {
+      while (agentTurnHistory.length > 20) {
         agentTurnHistory.shift();
       }
 
@@ -553,11 +614,13 @@ chatForm.addEventListener("submit", async (event) => {
           chatModeInput.value = "rag";
         }
         updateModeUxState();
-        questionInput.value = String(intakeResponse.proposedSearchQuery);
-        setSearchStatus("Modalita' ricerca attivata: query pronta. Premi Invia per eseguire la ricerca.");
+        pendingAutoSearchQuery = String(intakeResponse.proposedSearchQuery);
+        setSearchStatus("Modalita' ricerca attivata: intent completo, avvio automatico...");
         scheduleSearchPrefetch();
       }
     } else {
+      let metaHits = [];
+
       await sendQuestionStream(
         {
           question,
@@ -567,10 +630,20 @@ chatForm.addEventListener("submit", async (event) => {
         },
         {
           onMeta: (eventData) => {
-            updateDebugPanel(eventData.metadata, eventData.hits || []);
+            metaHits = eventData.hits || [];
+            lastRagSources = metaHits
+              .slice(0, 6)
+              .map((hit) => ({
+                titolo: hit?.titolo || "",
+                fonte: hit?.fonte || "",
+                data: hit?.data || "",
+                link: hit?.link || "",
+              }));
+            updateDebugPanel(eventData.metadata, metaHits);
             if (!eventData.context && lastAssistant) {
               stopThinking();
-              setAssistantContent(lastAssistant, "Nessun contesto trovato per la query indicata.");
+              assistantFinalText = "Nessun contesto trovato per la query indicata.";
+              setAssistantContent(lastAssistant, assistantFinalText);
             }
           },
           onToken: (tokenText) => {
@@ -579,6 +652,7 @@ chatForm.addEventListener("submit", async (event) => {
               lastAssistant.classList.add("is-typing");
             }
             answerBuffer += tokenText;
+            assistantFinalText = answerBuffer;
             if (lastAssistant) {
               setAssistantContent(lastAssistant, answerBuffer);
               messages.scrollTop = messages.scrollHeight;
@@ -589,8 +663,16 @@ chatForm.addEventListener("submit", async (event) => {
 
       if (lastAssistant && !answerBuffer.trim()) {
         stopThinking();
-        setAssistantContent(lastAssistant, "Risposta vuota dal modello.");
+        assistantFinalText = assistantFinalText || "Risposta vuota dal modello.";
+        setAssistantContent(lastAssistant, assistantFinalText);
       }
+
+      agentTurnHistory.push({ role: "user", content: question });
+      agentTurnHistory.push({ role: "assistant", content: assistantFinalText || answerBuffer || "" });
+      while (agentTurnHistory.length > 20) {
+        agentTurnHistory.shift();
+      }
+
     }
   } catch (error) {
     stopThinking();
@@ -605,6 +687,22 @@ chatForm.addEventListener("submit", async (event) => {
     lastAssistant?.classList.remove("is-typing");
     sendBtn.disabled = false;
     questionInput.focus();
+
+    if (pendingAutoSearchQuery) {
+      const autoQuery = pendingAutoSearchQuery;
+      pendingAutoSearchQuery = "";
+      questionInput.value = autoQuery;
+      scheduleUiStateSave();
+      setTimeout(() => chatForm.requestSubmit(), 0);
+      return;
+    }
+
+    if (!isAgentMode() && chatModeInput) {
+      chatModeInput.value = "agent";
+      updateModeUxState();
+      setSearchStatus("Modalita' agente riattivata automaticamente.");
+    }
+
     scheduleUiStateSave();
     if (!isAgentMode()) {
       scheduleSearchPrefetch();
@@ -634,6 +732,27 @@ limitInput.addEventListener("input", () => {
 });
 
 modelInput.addEventListener("input", scheduleUiStateSave);
+userModeBtn?.addEventListener("click", () => {
+  if (uiMode === "user") {
+    return;
+  }
+
+  setUiMode("user");
+  scheduleUiStateSave();
+});
+
+adminModeBtn?.addEventListener("click", () => {
+  if (uiMode === "admin") {
+    return;
+  }
+
+  setUiMode("admin");
+  scheduleUiStateSave();
+  if (!isAgentMode()) {
+    scheduleSearchPrefetch();
+  }
+});
+
 chatModeInput?.addEventListener("change", () => {
   scheduleUiStateSave();
   updateModeUxState();
