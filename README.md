@@ -26,6 +26,7 @@ cp .env.example .env
 ```
 
 3. Inserisci in `.env` la tua `SEARCH_API_KEY`.
+	Per la pagina bollettini puoi usare una chiave dedicata con `SEARCH_API_KEY_BOLLETTINO`.
 
 4. Avvia l'app:
 
@@ -42,6 +43,7 @@ Variabili disponibili in `.env`:
 - `PORT`: porta server web (default 3000)
 - `SEARCH_INDEX_URL`: endpoint search
 - `SEARCH_API_KEY`: token Bearer per search
+- `SEARCH_API_KEY_BOLLETTINO`: token Bearer specifico per indice `bollettino` (fallback su `SEARCH_API_KEY`)
 - `OLLAMA_BASE_URL`: endpoint Ollama (default `http://127.0.0.1:11434`)
 - `DEFAULT_SEARCH_QUERY`: query iniziale UI
 - `DEFAULT_LIMIT`: limite risultati predefinito

@@ -124,12 +124,14 @@ label {
 }
 
 input,
+select,
 textarea,
 button {
   font: inherit;
 }
 
 input,
+select,
 textarea {
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -139,6 +141,7 @@ textarea {
 }
 
 input:focus,
+select:focus,
 textarea:focus {
   outline: 2px solid rgba(35, 111, 120, 0.25);
   border-color: rgba(35, 111, 120, 0.45);

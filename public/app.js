@@ -3,7 +3,10 @@ const messages = document.getElementById("messages");
 const questionInput = document.getElementById("question");
 const limitInput = document.getElementById("limit");
 const modelInput = document.getElementById("model");
+const chatModeInput = document.getElementById("chatMode");
 const promptTemplateInput = document.getElementById("promptTemplate");
+const agentPromptTemplateInput = document.getElementById("agentPromptTemplate");
+const promptTemplateBlock = document.getElementById("promptTemplateBlock");
 const stateStatus = document.getElementById("stateStatus");
 const searchStatus = document.getElementById("searchStatus");
 const sendBtn = document.getElementById("sendBtn");
@@ -11,12 +14,62 @@ const messageTemplate = document.getElementById("messageTemplate");
 const debugPanel = document.getElementById("debugPanel");
 const debugSummaryText = document.getElementById("debugSummaryText");
 const debugContent = document.getElementById("debugContent");
+const pageConfig = {
+  pageKey: window.CHAT_CONFIG?.pageKey || "notizie",
+  searchIndex: window.CHAT_CONFIG?.searchIndex || document.body?.dataset?.searchIndex || "testi_ecclesiali",
+  defaultChatMode: window.CHAT_CONFIG?.defaultChatMode || "agent",
+  introMessage:
+    window.CHAT_CONFIG?.introMessage
+    || "Pronto. In modalita' agente faccio raccolta guidata: tema + tempo. Quando i dati sono completi, passo a modalita' ricerca con query gia' pronta.",
+  agentPlaceholder:
+    window.CHAT_CONFIG?.agentPlaceholder
+    || "Modalita' agente: scrivi richiesta + periodo (es. ordinazioni di vescovi nel 2025)",
+  ragPlaceholder:
+    window.CHAT_CONFIG?.ragPlaceholder
+    || "Modalita' ricerca: invia la query finale, ad esempio: ordinazioni vescovi 2025",
+};
+const searchIndex = pageConfig.searchIndex;
+const uiScope = pageConfig.pageKey || "default";
 
 let saveTimer;
 let previewTimer;
 let previewSequence = 0;
 let prefetchAbortController;
 const LIVE_PREFETCH_DEBOUNCE_MS = 120;
+const agentTurnHistory = [];
+
+function isAgentMode() {
+  return (chatModeInput?.value || pageConfig.defaultChatMode) === "agent";
+}
+
+function setQuestionPlaceholder() {
+  if (!questionInput) {
+    return;
+  }
+
+  if (isAgentMode()) {
+    questionInput.placeholder = pageConfig.agentPlaceholder;
+    return;
+  }
+
+  questionInput.placeholder = pageConfig.ragPlaceholder;
+}
+
+function updateModeUxState() {
+  if (promptTemplateBlock) {
+    promptTemplateBlock.style.display = "grid";
+  }
+
+  if (isAgentMode()) {
+    setSearchStatus("Modalita' agente: raccolta dati guidata, ricerca disattivata finche' non sei pronto");
+    debugPanel.style.display = "none";
+    setQuestionPlaceholder();
+    return;
+  }
+
+  setSearchStatus("Ricerca contesto: inattiva");
+  setQuestionPlaceholder();
+}
 
 function setStateStatus(text) {
   stateStatus.textContent = text;
@@ -184,7 +237,9 @@ function collectUiState() {
     questionDraft: questionInput.value,
     limit: Number(limitInput.value || 5),
     model: modelInput.value.trim(),
+    chatMode: chatModeInput?.value || "agent",
     promptTemplate: promptTemplateInput.value,
+    agentPromptTemplate: agentPromptTemplateInput?.value || "",
   };
 }
 
@@ -194,7 +249,10 @@ async function saveUiState() {
   const state = await fetchJson("/api/ui-state", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(collectUiState()),
+    body: JSON.stringify({
+      ...collectUiState(),
+      scope: uiScope,
+    }),
   });
 
   setStateStatus("Stato locale: salvato sul server");
@@ -213,13 +271,20 @@ function scheduleUiStateSave() {
 }
 
 async function loadUiState() {
-  const state = await fetchJson("/api/ui-state");
+  const state = await fetchJson(`/api/ui-state?scope=${encodeURIComponent(uiScope)}`);
   questionInput.value = state.questionDraft || "";
   limitInput.value = String(state.limit || 5);
   modelInput.value = state.model || "gemma:7b";
+  if (chatModeInput) {
+    chatModeInput.value = state.chatMode || pageConfig.defaultChatMode;
+  }
   if (state.promptTemplate) {
     promptTemplateInput.value = state.promptTemplate;
   }
+  if (state.agentPromptTemplate && agentPromptTemplateInput) {
+    agentPromptTemplateInput.value = state.agentPromptTemplate;
+  }
+  updateModeUxState();
   setStateStatus("Stato locale: caricato dal server");
 }
 
@@ -238,6 +303,7 @@ async function prefetchSearch(question, limit, sequenceId) {
     body: JSON.stringify({
       searchQuery: question,
       limit,
+      searchIndex,
     }),
   });
 
@@ -252,6 +318,12 @@ async function prefetchSearch(question, limit, sequenceId) {
 
 function scheduleSearchPrefetch() {
   clearTimeout(previewTimer);
+
+  if (isAgentMode()) {
+    setSearchStatus("Modalita' agente: raccolta dati attiva, nessuna ricerca automatica");
+    return;
+  }
+
   const question = questionInput.value.trim();
   const limit = Number(limitInput.value || 5);
 
@@ -313,7 +385,21 @@ async function sendQuestion(payload) {
   return fetchJson("/api/rag", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      ...payload,
+      searchIndex,
+    }),
+  });
+}
+
+async function sendIntakeChat(payload) {
+  return fetchJson("/api/intake-chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...payload,
+      searchIndex,
+    }),
   });
 }
 
@@ -321,7 +407,10 @@ async function sendQuestionStream(payload, handlers) {
   const response = await fetch("/api/rag-stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      ...payload,
+      searchIndex,
+    }),
   });
 
   if (!response.ok) {
@@ -396,7 +485,9 @@ chatForm.addEventListener("submit", async (event) => {
 
   questionInput.value = "";
   scheduleUiStateSave();
-  scheduleSearchPrefetch();
+  if (!isAgentMode()) {
+    scheduleSearchPrefetch();
+  }
 
   appendMessage("user", question);
   sendBtn.disabled = true;
@@ -433,38 +524,73 @@ chatForm.addEventListener("submit", async (event) => {
   let answerBuffer = "";
 
   try {
-    await sendQuestionStream(
-      {
-      question,
-      limit,
-      model,
-      promptTemplate,
-      },
-      {
-        onMeta: (eventData) => {
-          updateDebugPanel(eventData.metadata, eventData.hits || []);
-          if (!eventData.context && lastAssistant) {
-            stopThinking();
-            setAssistantContent(lastAssistant, "Nessun contesto trovato per la query indicata.");
-          }
-        },
-        onToken: (tokenText) => {
-          if (!streamStarted) {
-            stopThinking();
-            lastAssistant.classList.add("is-typing");
-          }
-          answerBuffer += tokenText;
-          if (lastAssistant) {
-            setAssistantContent(lastAssistant, answerBuffer);
-            messages.scrollTop = messages.scrollHeight;
-          }
-        },
-      }
-    );
+    if (isAgentMode()) {
+      const intakeResponse = await sendIntakeChat({
+        question,
+        limit,
+        model,
+        history: agentTurnHistory,
+      });
 
-    if (lastAssistant && !answerBuffer.trim()) {
       stopThinking();
-      setAssistantContent(lastAssistant, "Risposta vuota dal modello.");
+      setAssistantContent(lastAssistant, intakeResponse?.answer || "Nessuna risposta dal supervisore.");
+
+      agentTurnHistory.push({ role: "user", content: question });
+      agentTurnHistory.push({ role: "assistant", content: intakeResponse?.answer || "" });
+      while (agentTurnHistory.length > 12) {
+        agentTurnHistory.shift();
+      }
+
+      if (Array.isArray(intakeResponse?.missingFields) && intakeResponse.missingFields.length > 0) {
+        const missingLabel = intakeResponse.missingFields.includes("topic")
+          ? (intakeResponse.missingFields.includes("time") ? "tema + tempo" : "tema")
+          : "tempo";
+        setSearchStatus(`Modalita' agente: manca ${missingLabel} (step guidato)`);
+      }
+
+      if (intakeResponse?.readyToSearch && intakeResponse?.proposedSearchQuery) {
+        if (chatModeInput) {
+          chatModeInput.value = "rag";
+        }
+        updateModeUxState();
+        questionInput.value = String(intakeResponse.proposedSearchQuery);
+        setSearchStatus("Modalita' ricerca attivata: query pronta. Premi Invia per eseguire la ricerca.");
+        scheduleSearchPrefetch();
+      }
+    } else {
+      await sendQuestionStream(
+        {
+          question,
+          limit,
+          model,
+          promptTemplate,
+        },
+        {
+          onMeta: (eventData) => {
+            updateDebugPanel(eventData.metadata, eventData.hits || []);
+            if (!eventData.context && lastAssistant) {
+              stopThinking();
+              setAssistantContent(lastAssistant, "Nessun contesto trovato per la query indicata.");
+            }
+          },
+          onToken: (tokenText) => {
+            if (!streamStarted) {
+              stopThinking();
+              lastAssistant.classList.add("is-typing");
+            }
+            answerBuffer += tokenText;
+            if (lastAssistant) {
+              setAssistantContent(lastAssistant, answerBuffer);
+              messages.scrollTop = messages.scrollHeight;
+            }
+          },
+        }
+      );
+
+      if (lastAssistant && !answerBuffer.trim()) {
+        stopThinking();
+        setAssistantContent(lastAssistant, "Risposta vuota dal modello.");
+      }
     }
   } catch (error) {
     stopThinking();
@@ -480,7 +606,9 @@ chatForm.addEventListener("submit", async (event) => {
     sendBtn.disabled = false;
     questionInput.focus();
     scheduleUiStateSave();
-    scheduleSearchPrefetch();
+    if (!isAgentMode()) {
+      scheduleSearchPrefetch();
+    }
   }
 });
 
@@ -489,13 +617,32 @@ questionInput.addEventListener("input", () => {
   scheduleSearchPrefetch();
 });
 
+questionInput.addEventListener("keydown", (event) => {
+  if (event.isComposing) {
+    return;
+  }
+
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    chatForm.requestSubmit();
+  }
+});
+
 limitInput.addEventListener("input", () => {
   scheduleUiStateSave();
   scheduleSearchPrefetch();
 });
 
 modelInput.addEventListener("input", scheduleUiStateSave);
+chatModeInput?.addEventListener("change", () => {
+  scheduleUiStateSave();
+  updateModeUxState();
+  if (!isAgentMode()) {
+    scheduleSearchPrefetch();
+  }
+});
 promptTemplateInput.addEventListener("input", scheduleUiStateSave);
+agentPromptTemplateInput?.addEventListener("input", scheduleUiStateSave);
 
 loadUiState()
   .then(() => {
@@ -509,5 +656,5 @@ loadUiState()
 
 appendMessage(
   "assistant",
-  "Pronto. Inserisci una domanda e premi Invia. Il sistema usera' solo il contesto recuperato dalla search API."
+  pageConfig.introMessage
 );

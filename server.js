@@ -15,7 +15,9 @@ const port = Number(process.env.PORT || 3000);
 const SEARCH_INDEX_URL =
   process.env.SEARCH_INDEX_URL ||
   "https://search.appnativeitalia.com/indexes/testi_ecclesiali/search";
+const DEFAULT_SEARCH_INDEX = process.env.DEFAULT_SEARCH_INDEX || "testi_ecclesiali";
 const SEARCH_API_KEY = process.env.SEARCH_API_KEY || "";
+const SEARCH_API_KEY_BOLLETTINO = process.env.SEARCH_API_KEY_BOLLETTINO || "";
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
 const OLLAMA_NON_STREAM_TIMEOUT_MS = Number(process.env.OLLAMA_NON_STREAM_TIMEOUT_MS || 90_000);
 
@@ -26,11 +28,71 @@ const MAX_TEXT_EXCERPT_CHARS = Number(process.env.MAX_TEXT_EXCERPT_CHARS || 1800
 const MAX_CONTEXT_DOCS = Number(process.env.MAX_CONTEXT_DOCS || 3);
 const SEARCH_CANDIDATE_MULTIPLIER = Number(process.env.SEARCH_CANDIDATE_MULTIPLIER || 3);
 const SEARCH_CACHE_TTL_MS = 30_000;
+const UI_STATE_SCOPE_DEFAULT = "default";
+const SEARCH_PROFILES = {
+  testi_ecclesiali: {
+    key: "notizie",
+    strictTemporalDisambiguation: false,
+    defaultChatMode: "rag",
+  },
+  bollettino: {
+    key: "bollettini",
+    strictTemporalDisambiguation: true,
+    defaultChatMode: "agent",
+  },
+};
 const AI_ENTITY_FALLBACK_ENABLED = process.env.AI_ENTITY_FALLBACK_ENABLED !== "false";
 const AI_ENTITY_MIN_LOCAL_TERMS = Number(process.env.AI_ENTITY_MIN_LOCAL_TERMS || 3);
 const AI_ENTITY_TIMEOUT_MS = Number(process.env.AI_ENTITY_TIMEOUT_MS || 1800);
 const AI_ENTITY_MODEL = process.env.AI_ENTITY_MODEL || DEFAULT_MODEL;
 const AI_ENTITY_CACHE_TTL_MS = 60_000;
+const AI_INTENT_ENABLED = process.env.AI_INTENT_ENABLED !== "false";
+const AI_INTENT_MODEL = process.env.AI_INTENT_MODEL || AI_ENTITY_MODEL;
+const AI_INTENT_TIMEOUT_MS = Number(process.env.AI_INTENT_TIMEOUT_MS || 2200);
+const AI_INTENT_CACHE_TTL_MS = Number(process.env.AI_INTENT_CACHE_TTL_MS || 45_000);
+const TEMPORAL_MONTH_TERMS = [
+  "gennaio",
+  "febbraio",
+  "marzo",
+  "aprile",
+  "maggio",
+  "giugno",
+  "luglio",
+  "agosto",
+  "settembre",
+  "ottobre",
+  "novembre",
+  "dicembre",
+];
+const TEMPORAL_REFERENCE_TERMS = [
+  "oggi",
+  "ieri",
+  "domani",
+  "settimana",
+  "settimane",
+  "mese",
+  "mesi",
+  "anno",
+  "anni",
+  "trimestre",
+  "semestre",
+  "ultimo",
+  "ultimi",
+  "ultima",
+  "ultime",
+  "scorso",
+  "scorsi",
+  "scorsa",
+  "scorse",
+  "precedente",
+  "precedenti",
+  "recente",
+  "recenti",
+  "recentemente",
+  "attuale",
+  "attuali",
+  "pontificato",
+];
 const UI_STATE_FILE = path.join(__dirname, "storage", "ui-state.json");
 const DEFAULT_PROMPT_TEMPLATE = `Usa solo il contesto seguente.
 
@@ -69,8 +131,26 @@ Regole:
 - non usare conoscenze esterne
 - non inventare fatti
 - usa solo il contesto fornito`;
+const DEFAULT_AGENT_PROMPT_TEMPLATE = `Classifica l'intento di una richiesta utente per preparare ricerca documentale.
+Restituisci SOLO JSON valido con schema:
+{"needsTopic":boolean,"needsTime":boolean,"isTimeSensitive":boolean,"confidence":number}
+
+Regole:
+- needsTopic=true se il tema richiesto e' troppo vago
+- needsTime=true se manca un riferimento temporale essenziale
+- isTimeSensitive=true se il tipo di domanda dipende dal tempo (eventi, nomine, ordinazioni, aggiornamenti)
+- confidence tra 0 e 1
+- niente testo extra
+
+Modalita' strictTemporal: {{strictTemporal}}
+Storico utente:
+{{history}}
+
+Ultima domanda utente:
+{{question}}`;
 const searchCache = new Map();
 const questionAnalysisCache = new Map();
+const intentAnalysisCache = new Map();
 const ITALIAN_STOP_WORDS = new Set([
   "a",
   "ad",
@@ -285,6 +365,128 @@ function normalizeEntityPayload(payload) {
 
 function normalizeApostrophes(value) {
   return String(value || "").replace(/[’']/g, " ");
+}
+
+function hasTemporalReference(question) {
+  const raw = String(question || "").toLowerCase().trim();
+  const normalized = normalizeText(normalizeApostrophes(question));
+
+  if (!raw || !normalized) {
+    return false;
+  }
+
+  if (/\b(19|20)\d{2}\b/.test(raw)) {
+    return true;
+  }
+
+  if (/\b\d{1,2}[/.\-]\d{1,2}([/.\-]\d{2,4})?\b/.test(raw)) {
+    return true;
+  }
+
+  if (TEMPORAL_MONTH_TERMS.some((month) => normalized.includes(month))) {
+    return true;
+  }
+
+  if (TEMPORAL_REFERENCE_TERMS.some((term) => normalized.includes(term))) {
+    return true;
+  }
+
+  return false;
+}
+
+function getSearchProfile(searchIndex) {
+  const normalizedIndex = normalizeSearchIndex(searchIndex);
+  return SEARCH_PROFILES[normalizedIndex] || SEARCH_PROFILES[DEFAULT_SEARCH_INDEX] || SEARCH_PROFILES.testi_ecclesiali;
+}
+
+async function inferIntentRequirementsWithAi({ question, history, strictTemporal, promptTemplate }) {
+  if (!AI_INTENT_ENABLED) {
+    return null;
+  }
+
+  const historyText = getUserHistoryText(history);
+  const merged = [historyText, String(question || "").trim()].filter(Boolean).join(" ");
+  const cacheKey = `intent::${strictTemporal ? "strict" : "relaxed"}::${normalizeText(merged)}`;
+  const now = Date.now();
+  const cached = intentAnalysisCache.get(cacheKey);
+  if (cached && now - cached.timestamp < AI_INTENT_CACHE_TTL_MS) {
+    return cached.payload;
+  }
+
+  const template = String(promptTemplate || DEFAULT_AGENT_PROMPT_TEMPLATE);
+  const prompt = template
+    .replaceAll("{{strictTemporal}}", strictTemporal ? "true" : "false")
+    .replaceAll("{{history}}", historyText || "(vuoto)")
+    .replaceAll("{{question}}", String(question || "").trim());
+
+  try {
+    const raw = await askOllamaWithTimeout(prompt, AI_INTENT_MODEL, AI_INTENT_TIMEOUT_MS);
+    const parsed = extractJsonObject(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    const payload = {
+      needsTopic: Boolean(parsed.needsTopic),
+      needsTime: Boolean(parsed.needsTime),
+      isTimeSensitive: Boolean(parsed.isTimeSensitive),
+      confidence: Number(parsed.confidence || 0),
+    };
+
+    if (!Number.isFinite(payload.confidence)) {
+      payload.confidence = 0;
+    }
+
+    intentAnalysisCache.set(cacheKey, {
+      timestamp: now,
+      payload,
+    });
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function getTemporalDisambiguation(question, options = {}) {
+  if (!options.strict) {
+    return null;
+  }
+
+  const normalized = normalizeText(normalizeApostrophes(question));
+  if (!normalized) {
+    return null;
+  }
+
+  const aiIntent = await inferIntentRequirementsWithAi({
+    question,
+    history: options.history || [],
+    strictTemporal: true,
+  });
+
+  const ruleTimeSensitive =
+    /ordinaz/.test(normalized)
+    || /consacraz/.test(normalized)
+    || (/nomin/.test(normalized) && /vescov/.test(normalized));
+
+  const aiReliable = aiIntent && aiIntent.confidence >= 0.6;
+  const isTimeSensitiveQuestion = aiReliable
+    ? Boolean(aiIntent.needsTime || aiIntent.isTimeSensitive)
+    : ruleTimeSensitive;
+
+  if (!isTimeSensitiveQuestion) {
+    return null;
+  }
+
+  if (hasTemporalReference(question)) {
+    return null;
+  }
+
+  return {
+    required: true,
+    message:
+      "Per questa ricerca serve un riferimento temporale. Specifica ad esempio: 'nel 2025', 'negli ultimi 12 mesi' oppure 'tra gennaio e marzo 2024'.",
+  };
 }
 
 function buildLocalQuestionAnalysis(question) {
@@ -511,12 +713,64 @@ function isLowQualityHit(hit) {
   return false;
 }
 
-async function runSearchQuery(query, limit) {
-  const searchResponse = await fetch(SEARCH_INDEX_URL, {
+function normalizeSearchIndex(indexName) {
+  const candidate = String(indexName || "").trim().toLowerCase();
+  if (!candidate) {
+    return DEFAULT_SEARCH_INDEX;
+  }
+
+  if (!/^[a-z0-9_-]+$/.test(candidate)) {
+    throw new Error("Nome indice non valido");
+  }
+
+  return candidate;
+}
+
+function getSearchEndpoint(indexName) {
+  const normalizedIndex = normalizeSearchIndex(indexName);
+
+  try {
+    const baseUrl = new URL(SEARCH_INDEX_URL);
+    const pathParts = baseUrl.pathname.split("/").filter(Boolean);
+    const indexesPosition = pathParts.indexOf("indexes");
+
+    if (indexesPosition >= 0 && pathParts.length >= indexesPosition + 3) {
+      pathParts[indexesPosition + 1] = normalizedIndex;
+      baseUrl.pathname = `/${pathParts.join("/")}`;
+      return baseUrl.toString();
+    }
+  } catch {
+    // Fallback below keeps compatibility with malformed env URLs.
+  }
+
+  const trimmed = String(SEARCH_INDEX_URL || "").trim();
+  const replaced = trimmed.replace(/\/indexes\/[^/]+\/search(?:\?.*)?$/i, `/indexes/${normalizedIndex}/search`);
+  return replaced || `https://search.appnativeitalia.com/indexes/${normalizedIndex}/search`;
+}
+
+function getSearchApiKey(indexName) {
+  const normalizedIndex = normalizeSearchIndex(indexName);
+
+  if (normalizedIndex === "bollettino") {
+    return SEARCH_API_KEY_BOLLETTINO || SEARCH_API_KEY;
+  }
+
+  return SEARCH_API_KEY;
+}
+
+async function runSearchQuery(query, limit, searchIndex) {
+  const searchEndpoint = getSearchEndpoint(searchIndex);
+  const apiKey = getSearchApiKey(searchIndex);
+
+  if (!apiKey) {
+    throw new Error("SEARCH_API_KEY non configurata per l'indice richiesto");
+  }
+
+  const searchResponse = await fetch(searchEndpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${SEARCH_API_KEY}`,
+      Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
       q: query,
@@ -534,7 +788,7 @@ async function runSearchQuery(query, limit) {
   return hits.filter((hit) => !isLowQualityHit(hit));
 }
 
-async function runSeedSearchCandidates(searchQuery, analysis, candidateLimit) {
+async function runSeedSearchCandidates(searchQuery, analysis, candidateLimit, searchIndex) {
   const rawQuery = String(searchQuery || "").trim();
   const phraseQuery = rawQuery || analysis.retrievalQuery || DEFAULT_SEARCH_QUERY;
   // Use intent tokens (stop-word filtered) so prepositions like "sulla" don't
@@ -543,7 +797,9 @@ async function runSeedSearchCandidates(searchQuery, analysis, candidateLimit) {
   const allQueries = uniqueTerms([phraseQuery, ...tokenQueries]);
 
   const queryLimit = Math.max(Math.ceil(candidateLimit / 2), 5);
-  const queryResults = await Promise.all(allQueries.map((q) => runSearchQuery(q, queryLimit)));
+  const queryResults = await Promise.all(
+    allQueries.map((q) => runSearchQuery(q, queryLimit, searchIndex))
+  );
 
   const merged = [];
   const seen = new Set();
@@ -843,11 +1099,14 @@ function buildLiveEntitySignal(candidateHits, analysis, selectedHitIds) {
   };
 }
 
-function getDefaultUiState() {
+function getDefaultUiState(scope = UI_STATE_SCOPE_DEFAULT) {
+  const profile = scope === "bollettini" ? SEARCH_PROFILES.bollettino : SEARCH_PROFILES.testi_ecclesiali;
   return {
     limit: DEFAULT_LIMIT,
     model: DEFAULT_MODEL,
+    chatMode: profile.defaultChatMode,
     promptTemplate: DEFAULT_PROMPT_TEMPLATE,
+    agentPromptTemplate: DEFAULT_AGENT_PROMPT_TEMPLATE,
     questionDraft: "",
   };
 }
@@ -856,36 +1115,88 @@ async function ensureStorageDir() {
   await fs.mkdir(path.dirname(UI_STATE_FILE), { recursive: true });
 }
 
-function sanitizeUiState(rawState) {
-  const defaults = getDefaultUiState();
+function sanitizeUiState(rawState, scope = UI_STATE_SCOPE_DEFAULT) {
+  const defaults = getDefaultUiState(scope);
   const parsedLimit = Number(rawState?.limit ?? defaults.limit);
+  const parsedChatMode = String(rawState?.chatMode || defaults.chatMode).trim().toLowerCase();
+  const chatMode = parsedChatMode === "rag" ? "rag" : "agent";
 
   return {
     limit: Number.isFinite(parsedLimit) ? parsedLimit : defaults.limit,
     model: String(rawState?.model || defaults.model).trim() || defaults.model,
+    chatMode,
     promptTemplate:
       String(rawState?.promptTemplate || defaults.promptTemplate) || defaults.promptTemplate,
+    agentPromptTemplate:
+      String(rawState?.agentPromptTemplate || defaults.agentPromptTemplate)
+      || defaults.agentPromptTemplate,
     questionDraft: String(rawState?.questionDraft || ""),
   };
 }
 
-async function readUiState() {
+function normalizeUiScope(scope) {
+  const candidate = String(scope || "").trim().toLowerCase();
+  if (candidate === "notizie" || candidate === "bollettini") {
+    return candidate;
+  }
+  return UI_STATE_SCOPE_DEFAULT;
+}
+
+function normalizeUiStateStore(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { scopes: {} };
+  }
+
+  if (raw.scopes && typeof raw.scopes === "object" && !Array.isArray(raw.scopes)) {
+    return { scopes: raw.scopes };
+  }
+
+  // Backward compatibility: legacy flat ui-state format.
+  return {
+    scopes: {
+      [UI_STATE_SCOPE_DEFAULT]: raw,
+    },
+  };
+}
+
+async function readUiState(scope = UI_STATE_SCOPE_DEFAULT) {
+  const normalizedScope = normalizeUiScope(scope);
   try {
     const fileContent = await fs.readFile(UI_STATE_FILE, "utf8");
-    return sanitizeUiState(JSON.parse(fileContent));
+    const store = normalizeUiStateStore(JSON.parse(fileContent));
+    return sanitizeUiState(store.scopes[normalizedScope], normalizedScope);
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-      return getDefaultUiState();
+      return getDefaultUiState(normalizedScope);
     }
 
     throw error;
   }
 }
 
-async function writeUiState(nextState) {
+async function writeUiState(nextState, scope = UI_STATE_SCOPE_DEFAULT) {
+  const normalizedScope = normalizeUiScope(scope);
   await ensureStorageDir();
-  const state = sanitizeUiState(nextState);
-  await fs.writeFile(UI_STATE_FILE, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  let currentStore = { scopes: {} };
+
+  try {
+    const fileContent = await fs.readFile(UI_STATE_FILE, "utf8");
+    currentStore = normalizeUiStateStore(JSON.parse(fileContent));
+  } catch (error) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
+      throw error;
+    }
+  }
+
+  const state = sanitizeUiState(nextState, normalizedScope);
+  const nextStore = {
+    scopes: {
+      ...currentStore.scopes,
+      [normalizedScope]: state,
+    },
+  };
+
+  await fs.writeFile(UI_STATE_FILE, `${JSON.stringify(nextStore, null, 2)}\n`, "utf8");
   return state;
 }
 
@@ -1002,16 +1313,21 @@ function buildPrompt(question, context, promptTemplate) {
     .replaceAll("{{question}}", question);
 }
 
-async function fetchContext(searchQuery, limit) {
-  if (!SEARCH_API_KEY) {
-    throw new Error("SEARCH_API_KEY non configurata");
+async function fetchContext(searchQuery, limit, searchIndex) {
+  if (!getSearchApiKey(searchIndex)) {
+    throw new Error("SEARCH_API_KEY non configurata per l'indice richiesto");
   }
 
   const analysis = await analyzeQuestion(searchQuery);
   const candidateLimit = Math.max(limit, Math.min(limit * SEARCH_CANDIDATE_MULTIPLIER, 15));
 
   // Pass 1: collect candidate documents to discover saved entities in the index.
-  const seedCandidates = await runSeedSearchCandidates(searchQuery, analysis, candidateLimit);
+  const seedCandidates = await runSeedSearchCandidates(
+    searchQuery,
+    analysis,
+    candidateLimit,
+    searchIndex
+  );
   const entitySignal = buildEntityAwareSignal(seedCandidates, searchQuery);
   const retrievalQuery = entitySignal.retrievalTerms.join(" ");
 
@@ -1030,7 +1346,7 @@ async function fetchContext(searchQuery, limit) {
 
   const perQueryLimit = Math.max(3, Math.ceil(candidateLimit / 2));
   const queryResults = await Promise.all(
-    expandedQueries.map((q) => runSearchQuery(q, perQueryLimit))
+    expandedQueries.map((q) => runSearchQuery(q, perQueryLimit, searchIndex))
   );
 
   const candidateHits = dedupeHitsWithCap(
@@ -1100,8 +1416,9 @@ function getCacheKey(searchQuery, limit) {
   return `${limit}::${searchQuery.trim().toLowerCase()}`;
 }
 
-async function fetchContextCached(searchQuery, limit) {
-  const cacheKey = getCacheKey(searchQuery, limit);
+async function fetchContextCached(searchQuery, limit, searchIndex) {
+  const normalizedIndex = normalizeSearchIndex(searchIndex);
+  const cacheKey = `${normalizedIndex}::${getCacheKey(searchQuery, limit)}`;
   const now = Date.now();
   const cachedEntry = searchCache.get(cacheKey);
 
@@ -1109,7 +1426,7 @@ async function fetchContextCached(searchQuery, limit) {
     return { ...cachedEntry.payload, cached: true };
   }
 
-  const payload = await fetchContext(searchQuery, limit);
+  const payload = await fetchContext(searchQuery, limit, normalizedIndex);
   searchCache.set(cacheKey, {
     timestamp: now,
     payload,
@@ -1121,6 +1438,128 @@ async function fetchContextCached(searchQuery, limit) {
 async function askOllama(prompt, model) {
   const response = await askOllamaWithTimeout(prompt, model, OLLAMA_NON_STREAM_TIMEOUT_MS);
   return response || "Nessuna risposta dal modello.";
+}
+
+function getUserHistoryText(history) {
+  if (!Array.isArray(history)) {
+    return "";
+  }
+
+  return history
+    .filter((item) => String(item?.role || "").toLowerCase() === "user")
+    .map((item) => String(item?.content || "").trim())
+    .filter(Boolean)
+    .join(" ");
+}
+
+function isTimeSensitiveIntent(text) {
+  const normalized = normalizeText(normalizeApostrophes(text));
+  return /ordinaz/.test(normalized)
+    || /consacraz/.test(normalized)
+    || (/nomin/.test(normalized) && /vescov/.test(normalized));
+}
+
+function hasTopicReference(text) {
+  const intentTerms = tokenizeIntent(normalizeApostrophes(text));
+  return uniqueTerms(intentTerms).length >= 2;
+}
+
+function buildProposedSearchQuery(text) {
+  const terms = uniqueTerms(tokenizeIntent(normalizeApostrophes(text))).slice(0, 16);
+  return terms.join(" ");
+}
+
+async function buildIntakeDecision({ question, history, profile, agentPromptTemplate }) {
+  const historyText = getUserHistoryText(history);
+  const mergedText = [historyText, String(question || "").trim()].filter(Boolean).join(" ");
+  const userTurns = (Array.isArray(history)
+    ? history.filter((item) => String(item?.role || "").toLowerCase() === "user").length
+    : 0) + 1;
+
+  const strictTemporal = Boolean(profile?.strictTemporalDisambiguation);
+  const aiIntent = await inferIntentRequirementsWithAi({
+    question,
+    history,
+    strictTemporal,
+    promptTemplate: agentPromptTemplate,
+  });
+
+  const aiReliable = aiIntent && aiIntent.confidence >= 0.55;
+  const ruleNeedsTopic = !hasTopicReference(mergedText);
+  const ruleNeedsTime = strictTemporal
+    && isTimeSensitiveIntent(mergedText)
+    && !hasTemporalReference(mergedText);
+
+  let needsTopic = ruleNeedsTopic;
+  let needsTime = ruleNeedsTime;
+
+  if (aiReliable) {
+    needsTopic = Boolean(aiIntent.needsTopic);
+
+    if (strictTemporal) {
+      needsTime = Boolean(aiIntent.needsTime || aiIntent.isTimeSensitive) && !hasTemporalReference(mergedText);
+    } else {
+      needsTime = false;
+    }
+
+    if (ruleNeedsTopic) {
+      needsTopic = true;
+    }
+  }
+
+  const missingFields = [];
+  if (needsTopic) {
+    missingFields.push("topic");
+  }
+  if (needsTime) {
+    missingFields.push("time");
+  }
+
+  if (missingFields.length === 0) {
+    const proposedSearchQuery = buildProposedSearchQuery(mergedText);
+    return {
+      readyToSearch: Boolean(proposedSearchQuery),
+      answer:
+        "Perfetto, ora ho i dati necessari. Passo alla ricerca: puoi inviare subito, oppure affinare la query proposta.",
+      proposedSearchQuery,
+      missingFields: [],
+      stage: "ready",
+    };
+  }
+
+  if (missingFields.length === 2) {
+    return {
+      readyToSearch: false,
+      answer:
+        "Per partire mi servono 2 dati: tema preciso e periodo temporale. Esempio: 'ordinazioni di vescovi nel 2025'.",
+      proposedSearchQuery: "",
+      missingFields,
+      stage: "need-topic-and-time",
+    };
+  }
+
+  if (missingFields.includes("topic")) {
+    return {
+      readyToSearch: false,
+      answer:
+        "Mi manca il tema preciso. Scrivi in una riga cosa vuoi cercare, ad esempio: 'ordinazioni di vescovi' oppure 'nomine episcopali'.",
+      proposedSearchQuery: "",
+      missingFields,
+      stage: "need-topic",
+    };
+  }
+
+  const strictTemplate =
+    "Formato rapido: 'ordinazioni di vescovi nel 2025' oppure 'nomine episcopali negli ultimi 12 mesi'.";
+  const softAsk = "Mi manca solo il periodo temporale. Indica anno o intervallo.";
+
+  return {
+    readyToSearch: false,
+    answer: userTurns >= 3 ? strictTemplate : `${softAsk} ${strictTemplate}`,
+    proposedSearchQuery: "",
+    missingFields,
+    stage: "need-time",
+  };
 }
 
 async function askOllamaStream(prompt, model, onToken) {
@@ -1200,7 +1639,8 @@ function writeNdjsonEvent(res, payload) {
 
 app.get("/api/ui-state", async (_, res) => {
   try {
-    const state = await readUiState();
+    const scope = normalizeUiScope(_.query?.scope);
+    const state = await readUiState(scope);
     return res.json(state);
   } catch (error) {
     return res.status(500).json({
@@ -1211,16 +1651,19 @@ app.get("/api/ui-state", async (_, res) => {
 
 app.post("/api/ui-state", async (req, res) => {
   try {
-    const currentState = await readUiState();
+    const scope = normalizeUiScope(req.body?.scope || req.query?.scope);
+    const currentState = await readUiState(scope);
     const nextState = {
       ...currentState,
       limit: req.body?.limit,
       model: req.body?.model,
+      chatMode: req.body?.chatMode,
       promptTemplate: req.body?.promptTemplate,
+      agentPromptTemplate: req.body?.agentPromptTemplate,
       questionDraft: req.body?.questionDraft,
     };
 
-    const savedState = await writeUiState(nextState);
+    const savedState = await writeUiState(nextState, scope);
     return res.json(savedState);
   } catch (error) {
     return res.status(500).json({
@@ -1229,10 +1672,42 @@ app.post("/api/ui-state", async (req, res) => {
   }
 });
 
+app.post("/api/intake-chat", async (req, res) => {
+  try {
+    const question = String(req.body?.question || "").trim();
+    const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
+    const profile = getSearchProfile(searchIndex);
+    const history = Array.isArray(req.body?.history) ? req.body.history : [];
+    const uiScope = profile.key;
+    const currentState = await readUiState(uiScope);
+
+    if (!question) {
+      return res.status(400).json({ error: "La domanda e' obbligatoria." });
+    }
+
+    const decision = await buildIntakeDecision({
+      question,
+      history,
+      profile,
+      agentPromptTemplate: currentState.agentPromptTemplate,
+    });
+    return res.json(decision);
+  } catch (error) {
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : "Errore intake agente",
+    });
+  }
+});
+
 app.post("/api/search-preview", async (req, res) => {
   try {
     const searchQuery = String(req.body?.searchQuery || "").trim();
     const limit = Number(req.body?.limit || DEFAULT_LIMIT);
+    const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
+    const profile = getSearchProfile(searchIndex);
+    const temporalDisambiguation = await getTemporalDisambiguation(searchQuery, {
+      strict: profile.strictTemporalDisambiguation,
+    });
 
     if (!searchQuery) {
       return res.json({
@@ -1241,7 +1716,23 @@ app.post("/api/search-preview", async (req, res) => {
         metadata: {
           searchQuery,
           limit,
+          searchIndex,
           cached: false,
+        },
+      });
+    }
+
+    if (temporalDisambiguation?.required) {
+      return res.json({
+        hits: [],
+        context: "",
+        metadata: {
+          searchQuery,
+          limit,
+          searchIndex,
+          cached: false,
+          temporalPromptRequired: true,
+          temporalPromptMessage: temporalDisambiguation.message,
         },
       });
     }
@@ -1249,7 +1740,8 @@ app.post("/api/search-preview", async (req, res) => {
     const { hits, context, cached, candidateCount, analysis, detectedEntities, entityKeywordTerms } =
       await fetchContextCached(
       searchQuery,
-      limit
+      limit,
+      searchIndex
     );
 
     return res.json({
@@ -1258,6 +1750,7 @@ app.post("/api/search-preview", async (req, res) => {
       metadata: {
         searchQuery,
         limit,
+        searchIndex,
         cached,
         candidateCount,
         retrievalQuery: analysis?.retrievalQuery || searchQuery,
@@ -1265,6 +1758,7 @@ app.post("/api/search-preview", async (req, res) => {
         detectedEntities: detectedEntities || { persone: [], luoghi: [], enti: [] },
         entityKeywordTerms: entityKeywordTerms || [],
         usedAiEntityFallback: Boolean(analysis?.usedAiEntityFallback),
+        temporalPromptRequired: false,
       },
     });
   } catch (error) {
@@ -1280,26 +1774,56 @@ app.post("/api/rag", async (req, res) => {
     const providedSearchQuery = String(req.body?.searchQuery || "").trim();
     const searchQuery = providedSearchQuery || question || DEFAULT_SEARCH_QUERY;
     const limit = Number(req.body?.limit || DEFAULT_LIMIT);
+    const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
+    const profile = getSearchProfile(searchIndex);
     const model = String(req.body?.model || DEFAULT_MODEL).trim();
     const promptTemplate = String(req.body?.promptTemplate || "");
+    const temporalDisambiguation = await getTemporalDisambiguation(question, {
+      strict: profile.strictTemporalDisambiguation,
+    });
 
     if (!question) {
       return res.status(400).json({ error: "La domanda e' obbligatoria." });
     }
 
-    const currentState = await readUiState();
+    if (temporalDisambiguation?.required) {
+      return res.status(200).json({
+        answer: temporalDisambiguation.message,
+        context: "",
+        hits: [],
+        metadata: {
+          model,
+          searchQuery,
+          limit,
+          searchIndex,
+          cached: false,
+          candidateCount: 0,
+          retrievalQuery: "",
+          queryTerms: [],
+          detectedEntities: { persone: [], luoghi: [], enti: [] },
+          entityKeywordTerms: [],
+          usedAiEntityFallback: false,
+          temporalPromptRequired: true,
+          temporalPromptMessage: temporalDisambiguation.message,
+        },
+      });
+    }
+
+    const uiScope = profile.key;
+    const currentState = await readUiState(uiScope);
     await writeUiState({
       ...currentState,
       limit,
       model,
       promptTemplate: promptTemplate || currentState.promptTemplate,
       questionDraft: question,
-    });
+    }, uiScope);
 
     const { hits, context, cached, candidateCount, analysis, detectedEntities, entityKeywordTerms } =
       await fetchContextCached(
       searchQuery,
-      limit
+      limit,
+      searchIndex
     );
 
     if (!context) {
@@ -1311,6 +1835,7 @@ app.post("/api/rag", async (req, res) => {
           model,
           searchQuery,
           limit,
+          searchIndex,
           cached,
           candidateCount,
           retrievalQuery: analysis?.retrievalQuery || searchQuery,
@@ -1318,6 +1843,7 @@ app.post("/api/rag", async (req, res) => {
           detectedEntities: detectedEntities || { persone: [], luoghi: [], enti: [] },
           entityKeywordTerms: entityKeywordTerms || [],
           usedAiEntityFallback: Boolean(analysis?.usedAiEntityFallback),
+          temporalPromptRequired: false,
         },
       });
     }
@@ -1333,6 +1859,7 @@ app.post("/api/rag", async (req, res) => {
         model,
         searchQuery,
         limit,
+        searchIndex,
         cached,
         candidateCount,
         retrievalQuery: analysis?.retrievalQuery || searchQuery,
@@ -1340,6 +1867,7 @@ app.post("/api/rag", async (req, res) => {
         detectedEntities: detectedEntities || { persone: [], luoghi: [], enti: [] },
         entityKeywordTerms: entityKeywordTerms || [],
         usedAiEntityFallback: Boolean(analysis?.usedAiEntityFallback),
+        temporalPromptRequired: false,
       },
     });
   } catch (error) {
@@ -1359,30 +1887,63 @@ app.post("/api/rag-stream", async (req, res) => {
     const providedSearchQuery = String(req.body?.searchQuery || "").trim();
     const searchQuery = providedSearchQuery || question || DEFAULT_SEARCH_QUERY;
     const limit = Number(req.body?.limit || DEFAULT_LIMIT);
+    const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
+    const profile = getSearchProfile(searchIndex);
     const model = String(req.body?.model || DEFAULT_MODEL).trim();
     const promptTemplate = String(req.body?.promptTemplate || "");
+    const temporalDisambiguation = await getTemporalDisambiguation(question, {
+      strict: profile.strictTemporalDisambiguation,
+    });
 
     if (!question) {
       writeNdjsonEvent(res, { type: "error", error: "La domanda e' obbligatoria." });
       return res.end();
     }
 
-    const currentState = await readUiState();
+    if (temporalDisambiguation?.required) {
+      writeNdjsonEvent(res, {
+        type: "meta",
+        metadata: {
+          model,
+          searchQuery,
+          limit,
+          searchIndex,
+          cached: false,
+          candidateCount: 0,
+          retrievalQuery: "",
+          queryTerms: [],
+          detectedEntities: { persone: [], luoghi: [], enti: [] },
+          entityKeywordTerms: [],
+          usedAiEntityFallback: false,
+          temporalPromptRequired: true,
+          temporalPromptMessage: temporalDisambiguation.message,
+        },
+        hits: [],
+        context: "",
+      });
+      writeNdjsonEvent(res, { type: "token", text: temporalDisambiguation.message });
+      writeNdjsonEvent(res, { type: "done" });
+      return res.end();
+    }
+
+    const uiScope = profile.key;
+    const currentState = await readUiState(uiScope);
     await writeUiState({
       ...currentState,
       limit,
       model,
       promptTemplate: promptTemplate || currentState.promptTemplate,
       questionDraft: question,
-    });
+    }, uiScope);
 
     const { hits, context, cached, candidateCount, analysis, detectedEntities, entityKeywordTerms } =
-      await fetchContextCached(searchQuery, limit);
+      await fetchContextCached(searchQuery, limit, searchIndex);
 
     const metadata = {
       model,
       searchQuery,
       limit,
+      searchIndex,
       cached,
       candidateCount,
       retrievalQuery: analysis?.retrievalQuery || searchQuery,
@@ -1390,6 +1951,7 @@ app.post("/api/rag-stream", async (req, res) => {
       detectedEntities: detectedEntities || { persone: [], luoghi: [], enti: [] },
       entityKeywordTerms: entityKeywordTerms || [],
       usedAiEntityFallback: Boolean(analysis?.usedAiEntityFallback),
+      temporalPromptRequired: false,
     };
 
     writeNdjsonEvent(res, { type: "meta", metadata, hits, context });
