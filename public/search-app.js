@@ -26,6 +26,7 @@ let currentHits    = [];
 let currentQuery   = "";
 let aiAbortCtrl    = null;   // AbortController per cancellare lo stream AI in corso
 let aiDebounceTimer = null;
+let activeFilters = {};
 
 // ─── Utilità ─────────────────────────────────────────────────────────────────
 
@@ -57,6 +58,139 @@ function formatDate(d) {
 }
 
 function $(id) { return document.getElementById(id); }
+
+function renderMarkdown(rawText) {
+  const citationTokenized = String(rawText || "").replace(/\[(\d+)\]/g, (_, n) => `@@CIT_${n}@@`);
+
+  let html;
+  if (window.marked?.parse) {
+    html = window.marked.parse(citationTokenized, {
+      gfm: true,
+      breaks: true,
+      mangle: false,
+      headerIds: false,
+    });
+  } else {
+    html = escHtml(citationTokenized).replace(/\n/g, "<br>");
+  }
+
+  if (window.DOMPurify?.sanitize) {
+    html = window.DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+  }
+
+  return html.replace(
+    /@@CIT_(\d+)@@/g,
+    (_, n) => `<button class="citation" data-n="${n}" aria-label="Fonte ${n}">[${n}]</button>`
+  );
+}
+
+function hasActiveFilters() {
+  return Object.values(activeFilters).some((values) => Array.isArray(values) && values.length > 0);
+}
+
+function humanizeFacetName(name) {
+  return String(name || "")
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function normalizeFacetValue(value) {
+  return String(value ?? "").trim();
+}
+
+function buildFilterExpression(filters) {
+  const clauses = [];
+  for (const [field, values] of Object.entries(filters)) {
+    if (!Array.isArray(values) || values.length === 0) continue;
+    const ors = values
+      .map((v) => `${field} = "${normalizeFacetValue(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`)
+      .join(" OR ");
+    clauses.push(values.length > 1 ? `(${ors})` : ors);
+  }
+  return clauses.join(" AND ");
+}
+
+function triggerSearchRefresh() {
+  const input = document.querySelector(".ais-SearchBox-input");
+  if (!input) return;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function toggleDynamicFilter(field, value) {
+  const next = { ...activeFilters };
+  const current = new Set(next[field] || []);
+  if (current.has(value)) current.delete(value);
+  else current.add(value);
+  const values = Array.from(current);
+  if (values.length === 0) delete next[field];
+  else next[field] = values;
+  activeFilters = next;
+  triggerSearchRefresh();
+}
+
+function renderDynamicFilters(facetDistribution = {}, query = "") {
+  const box = $("dynamic-filters");
+  const groupsRoot = $("filter-groups");
+  const clearBtn = $("clear-filters-btn");
+  if (!box || !groupsRoot || !clearBtn) return;
+
+  groupsRoot.innerHTML = "";
+
+  if (!query || query.trim().length < 2) {
+    box.classList.add("hidden");
+    clearBtn.classList.add("hidden");
+    return;
+  }
+
+  const fields = Object.keys(facetDistribution || {}).filter(
+    (field) => facetDistribution[field] && Object.keys(facetDistribution[field]).length > 0
+  );
+
+  if (fields.length === 0) {
+    box.classList.add("hidden");
+    clearBtn.classList.add("hidden");
+    return;
+  }
+
+  fields.sort((a, b) => a.localeCompare(b, "it"));
+  fields.forEach((field) => {
+    const valuesMap = facetDistribution[field] || {};
+    const values = Object.entries(valuesMap)
+      .sort((a, b) => Number(b[1]) - Number(a[1]))
+      .slice(0, 10);
+    if (values.length === 0) return;
+
+    const group = document.createElement("div");
+    group.className = "filter-group";
+
+    const label = document.createElement("div");
+    label.className = "filter-group-label";
+    label.textContent = humanizeFacetName(field);
+    group.appendChild(label);
+
+    const chips = document.createElement("div");
+    chips.className = "filter-chips";
+    values.forEach(([rawValue, count]) => {
+      const value = normalizeFacetValue(rawValue);
+      if (!value) return;
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "filter-chip";
+      if ((activeFilters[field] || []).includes(value)) chip.classList.add("is-active");
+      chip.textContent = `${value} (${count})`;
+      chip.addEventListener("click", () => toggleDynamicFilter(field, value));
+      chips.appendChild(chip);
+    });
+    if (chips.childElementCount === 0) return;
+    group.appendChild(chips);
+    groupsRoot.appendChild(group);
+  });
+
+  clearBtn.classList.toggle("hidden", !hasActiveFilters());
+  box.classList.toggle("hidden", groupsRoot.childElementCount === 0);
+}
 
 // ─── Render hit card ──────────────────────────────────────────────────────────
 
@@ -198,12 +332,16 @@ async function generateAiAnswer(query, hits) {
         }
 
         if (evt.type === "done" && answerEl) {
-          // Post-process: rende le citazioni [n] cliccabili
+          // Post-process: markdown + citazioni [n] cliccabili
           const raw = answerEl.textContent;
-          answerEl.innerHTML = escHtml(raw).replace(
-            /\[(\d+)\]/g,
-            (_, n) => `<button class="citation" data-n="${n}" aria-label="Fonte ${n}">[${n}]</button>`
-          );
+          answerEl.innerHTML = renderMarkdown(raw);
+
+          // Link markdown: apri sempre in nuova tab
+          answerEl.querySelectorAll("a").forEach((a) => {
+            a.setAttribute("target", "_blank");
+            a.setAttribute("rel", "noopener noreferrer");
+          });
+
           // Collega click citazioni
           answerEl.querySelectorAll(".citation").forEach((btn) => {
             btn.addEventListener("click", () => highlightCard(Number(btn.dataset.n)));
@@ -273,6 +411,7 @@ function createBackendSearchClient() {
       const index  = $("index-select")?.value || "testi_ecclesiali";
       const limit  = req.params.hitsPerPage ?? 20;
       const offset = (req.params.page ?? 0) * limit;
+      const filter = buildFilterExpression(activeFilters);
 
       // Skeleton mentre carica
       const hitsList = $("hits");
@@ -289,13 +428,15 @@ function createBackendSearchClient() {
           index,
           limit,
           offset,
-          facets: ["fonte", "tipo_documento"],
+          filter,
+          facets: ["*"],
         }),
       })
       .then((r) => r.json())
       .then((data) => {
         currentHits  = data.hits ?? [];
         currentQuery = query;
+        renderDynamicFilters(data.facetDistribution ?? {}, query);
         return {
           results: [{
             hits:               currentHits,
@@ -505,6 +646,8 @@ function init() {
 
   // Cambio archivio → re-trigger search
   $("index-select")?.addEventListener("change", () => {
+    activeFilters = {};
+    renderDynamicFilters({}, "");
     const input = document.querySelector(".ais-SearchBox-input");
     if (input && input.value) {
       const q = input.value;
@@ -525,6 +668,11 @@ function init() {
 
   // Modelli Ollama — caricati dopo loadAdminState() via then()
 
+  $("clear-filters-btn")?.addEventListener("click", () => {
+    activeFilters = {};
+    triggerSearchRefresh();
+  });
+
   // InstantSearch
   const searchInstance = instantsearch({
     indexName:    "testi_ecclesiali",
@@ -534,6 +682,7 @@ function init() {
       if (helper.state.query.trim().length < 2) {
         $("hits")?.replaceChildren();
         $("results-bar")?.classList.add("hidden");
+        renderDynamicFilters({}, "");
         return;
       }
       helper.search();
