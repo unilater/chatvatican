@@ -48,6 +48,7 @@ Variabili disponibili in `.env`:
 - `DEFAULT_SEARCH_QUERY`: query iniziale UI
 - `DEFAULT_LIMIT`: limite risultati predefinito
 - `DEFAULT_MODEL`: modello Ollama predefinito
+- `DEFAULT_AGENT_MODEL` (o `AGENT_MODEL`): modello Ollama dedicato al flusso agente/intake (se assente, fallback su `DEFAULT_MODEL`)
 
 ## API locale
 

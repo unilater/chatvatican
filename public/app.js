@@ -2,7 +2,8 @@ const chatForm = document.getElementById("chatForm");
 const messages = document.getElementById("messages");
 const questionInput = document.getElementById("question");
 const limitInput = document.getElementById("limit");
-const modelInput = document.getElementById("model");
+const agentModelInput = document.getElementById("agentModel");
+const ragModelInput = document.getElementById("ragModel");
 const chatModeInput = document.getElementById("chatMode");
 const promptTemplateInput = document.getElementById("promptTemplate");
 const agentPromptTemplateInput = document.getElementById("agentPromptTemplate");
@@ -29,6 +30,7 @@ const pageConfig = {
   ragPlaceholder:
     window.CHAT_CONFIG?.ragPlaceholder
     || "Modalita' ricerca: invia la query finale, ad esempio: ordinazioni vescovi 2025",
+  agentModel: window.CHAT_CONFIG?.agentModel || "",
 };
 const searchIndex = pageConfig.searchIndex;
 const uiScope = pageConfig.pageKey || "default";
@@ -38,7 +40,8 @@ let saveTimer;
 let previewTimer;
 let previewSequence = 0;
 let prefetchAbortController;
-let pendingAutoSearchQuery = "";
+let pendingAutoSearchRequest = null;
+let lastAgentDebugPayload = null;
 const LIVE_PREFETCH_DEBOUNCE_MS = 120;
 const agentTurnHistory = [];
 let lastRagSources = [];
@@ -75,6 +78,14 @@ function isAgentMode() {
   return (chatModeInput?.value || pageConfig.defaultChatMode) === "agent";
 }
 
+function getActiveModel() {
+  if (isAgentMode()) {
+    return String(agentModelInput?.value || pageConfig.agentModel || "").trim();
+  }
+
+  return String(ragModelInput?.value || "").trim();
+}
+
 function setQuestionPlaceholder() {
   if (!questionInput) {
     return;
@@ -102,7 +113,11 @@ function updateModeUxState() {
 
   if (isAgentMode()) {
     setSearchStatus("Modalita' agente: raccolta dati guidata, ricerca disattivata finche' non sei pronto");
-    debugPanel.style.display = "none";
+    if (lastAgentDebugPayload) {
+      updateDebugPanel(lastAgentDebugPayload.metadata, []);
+    } else {
+      debugPanel.style.display = "";
+    }
     return;
   }
 
@@ -172,6 +187,29 @@ function normalizeReasoningBlocks(text) {
   return output.trim();
 }
 
+function buildAgentDebugPayload(intakeResponse) {
+  const researchJson = intakeResponse?.researchJson || {};
+  const searchPlan = intakeResponse?.searchPlan || researchJson?.searchPlan || null;
+  const entities = researchJson?.entities || { persone: [], luoghi: [], enti: [] };
+  const terms = researchJson?.terms || [];
+
+  return {
+    metadata: {
+      debugMode: "agent",
+      stage: intakeResponse?.stage || researchJson?.stage || "agent",
+      cached: false,
+      candidateCount: "-",
+      retrievalQuery: searchPlan?.textQuery || researchJson?.searchQuery || "",
+      activeFilter: searchPlan?.filterExpression || "",
+      searchPlan,
+      queryTerms: terms,
+      detectedEntities: entities,
+      entityKeywordTerms: [],
+      usedAiEntityFallback: false,
+    },
+  };
+}
+
 function updateDebugPanel(metadata, hits) {
   if (!isAdminMode()) {
     debugPanel.style.display = "none";
@@ -181,14 +219,19 @@ function updateDebugPanel(metadata, hits) {
   const terms = metadata?.queryTerms || [];
   const entityKeywordTerms = metadata?.entityKeywordTerms || [];
   const retrieval = metadata?.retrievalQuery || "";
+  const activeFilter = metadata?.activeFilter || "";
+  const searchPlan = metadata?.searchPlan || null;
   const candidates = metadata?.candidateCount ?? "?";
   const cached = metadata?.cached;
+  const debugMode = metadata?.debugMode || "rag";
+  const stage = metadata?.stage || "";
   const entities = metadata?.detectedEntities || { persone: [], luoghi: [], enti: [] };
   const usedAiEntityFallback = Boolean(metadata?.usedAiEntityFallback);
 
   const cacheLabel = cached ? " · cache calda" : " · query fresca";
-  debugSummaryText.textContent =
-    `Debug ricerca — ${hits.length} doc selezionati su ${candidates} candidati${cacheLabel}`;
+  debugSummaryText.textContent = debugMode === "agent"
+    ? `Debug agente — stage ${stage || "-"}`
+    : `Debug ricerca — ${hits.length} doc selezionati su ${candidates} candidati${cacheLabel}`;
 
   const kwHtml =
     terms.length > 0
@@ -199,6 +242,13 @@ function updateDebugPanel(metadata, hits) {
     entityKeywordTerms.length > 0
       ? entityKeywordTerms.map((t) => `<span class="kw-tag">${escapeHtml(t)}</span>`).join("")
       : `<span style="color:var(--muted);font-style:italic">nessuna keyword da entity candidate</span>`;
+
+  const searchPlanFilters = searchPlan?.filters
+    ? escapeHtml(JSON.stringify(searchPlan.filters, null, 2))
+    : "";
+  const searchPlanDebug = searchPlan?.debug
+    ? escapeHtml(JSON.stringify(searchPlan.debug, null, 2))
+    : "";
 
   const entityGroups = [
     { label: "Persone", values: entities.persone || [] },
@@ -244,7 +294,7 @@ function updateDebugPanel(metadata, hits) {
               .join("\n");
           })
           .join("")
-      : `<p style="color:var(--muted);font-style:italic;margin:0">Nessun articolo trovato nel contesto.</p>`;
+      : `<p style="color:var(--muted);font-style:italic;margin:0">${debugMode === "agent" ? "Nessuna ricerca RAG eseguita in questo step." : "Nessun articolo trovato nel contesto."}</p>`;
 
   debugContent.innerHTML = [
     `<div class="debug-row">`,
@@ -260,12 +310,22 @@ function updateDebugPanel(metadata, hits) {
     `<span class="debug-query-val">${escapeHtml(retrieval)}</span>`,
     `</div>`,
     `<div class="debug-row">`,
+    `<span class="debug-label">Filter attivo:</span>`,
+    `<span class="debug-query-val">${activeFilter ? escapeHtml(activeFilter) : "nessuno"}</span>`,
+    `</div>`,
+    `<div class="debug-row">`,
     `<span class="debug-label">Entity extraction AI:</span>`,
     `<span class="debug-query-val">${usedAiEntityFallback ? "attiva (fallback usato)" : "non usata"}</span>`,
     `</div>`,
+    searchPlanFilters
+      ? `<div class="debug-row"><span class="debug-label">Search plan filters:</span><pre class="debug-query-val">${searchPlanFilters}</pre></div>`
+      : "",
+    searchPlanDebug
+      ? `<div class="debug-row"><span class="debug-label">Decisione agente:</span><pre class="debug-query-val">${searchPlanDebug}</pre></div>`
+      : "",
     entitiesHtml,
     `<div>`,
-    `<span class="debug-label">Articoli nel pre-contesto (${hits.length} su ${candidates} candidati):</span>`,
+    `<span class="debug-label">${debugMode === "agent" ? "Preview ricerca:" : `Articoli nel pre-contesto (${hits.length} su ${candidates} candidati):`}</span>`,
     `<div class="debug-articles">${articlesHtml}</div>`,
     `</div>`,
   ].join("\n");
@@ -288,7 +348,8 @@ function collectUiState() {
   return {
     questionDraft: questionInput.value,
     limit: Number(limitInput.value || 5),
-    model: modelInput.value.trim(),
+    ragModel: ragModelInput?.value?.trim() || "",
+    agentModel: agentModelInput?.value?.trim() || pageConfig.agentModel || "",
     uiMode,
     chatMode: chatModeInput?.value || "agent",
     promptTemplate: promptTemplateInput.value,
@@ -328,7 +389,12 @@ async function loadUiState() {
   setUiMode(state.uiMode || DEFAULT_UI_MODE);
   questionInput.value = state.questionDraft || "";
   limitInput.value = String(state.limit || 5);
-  modelInput.value = state.model || "gemma:7b";
+  if (ragModelInput) {
+    ragModelInput.value = state.ragModel || state.model || "gemma:7b";
+  }
+  if (agentModelInput) {
+    agentModelInput.value = state.agentModel || state.model || pageConfig.agentModel || "gemma:7b";
+  }
   if (chatModeInput) {
     // For this UX we always enter in agent mode, regardless of persisted state.
     chatModeInput.value = "agent";
@@ -532,9 +598,16 @@ chatForm.addEventListener("submit", async (event) => {
   event.preventDefault();
 
   const question = questionInput.value.trim();
+  const queuedAutoSearch = pendingAutoSearchRequest && pendingAutoSearchRequest.question === question
+    ? pendingAutoSearchRequest
+    : null;
   const limit = Number(limitInput.value || 5);
-  const model = modelInput.value.trim();
+  const model = getActiveModel();
   const promptTemplate = promptTemplateInput.value;
+
+  if (queuedAutoSearch) {
+    pendingAutoSearchRequest = null;
+  }
 
   if (!question) {
     return;
@@ -589,15 +662,21 @@ chatForm.addEventListener("submit", async (event) => {
         question,
         limit,
         model,
+        agentModel: String(agentModelInput?.value || pageConfig.agentModel || "").trim() || undefined,
         history: agentTurnHistory,
         previousSources: lastRagSources,
       });
 
       stopThinking();
-      setAssistantContent(lastAssistant, intakeResponse?.answer || "Nessuna risposta dal supervisore.");
+      const intakeAnswerText = intakeResponse?.answer || "Nessuna risposta dal supervisore.";
+      setAssistantContent(lastAssistant, intakeAnswerText);
+      lastAgentDebugPayload = buildAgentDebugPayload(intakeResponse);
+      if (isAdminMode()) {
+        updateDebugPanel(lastAgentDebugPayload.metadata, []);
+      }
 
       agentTurnHistory.push({ role: "user", content: question });
-      agentTurnHistory.push({ role: "assistant", content: intakeResponse?.answer || "" });
+      agentTurnHistory.push({ role: "assistant", content: intakeAnswerText });
       while (agentTurnHistory.length > 20) {
         agentTurnHistory.shift();
       }
@@ -614,7 +693,11 @@ chatForm.addEventListener("submit", async (event) => {
           chatModeInput.value = "rag";
         }
         updateModeUxState();
-        pendingAutoSearchQuery = String(intakeResponse.proposedSearchQuery);
+        pendingAutoSearchRequest = {
+          question,
+          searchQuery: String(intakeResponse.proposedSearchQuery),
+          searchPlan: intakeResponse?.searchPlan || intakeResponse?.researchJson?.searchPlan || null,
+        };
         setSearchStatus("Modalita' ricerca attivata: intent completo, avvio automatico...");
         scheduleSearchPrefetch();
       }
@@ -627,6 +710,8 @@ chatForm.addEventListener("submit", async (event) => {
           limit,
           model,
           promptTemplate,
+          searchQuery: queuedAutoSearch?.searchQuery || undefined,
+          searchPlan: queuedAutoSearch?.searchPlan || undefined,
         },
         {
           onMeta: (eventData) => {
@@ -688,10 +773,8 @@ chatForm.addEventListener("submit", async (event) => {
     sendBtn.disabled = false;
     questionInput.focus();
 
-    if (pendingAutoSearchQuery) {
-      const autoQuery = pendingAutoSearchQuery;
-      pendingAutoSearchQuery = "";
-      questionInput.value = autoQuery;
+    if (pendingAutoSearchRequest) {
+      questionInput.value = pendingAutoSearchRequest.question;
       scheduleUiStateSave();
       setTimeout(() => chatForm.requestSubmit(), 0);
       return;
@@ -731,7 +814,8 @@ limitInput.addEventListener("input", () => {
   scheduleSearchPrefetch();
 });
 
-modelInput.addEventListener("input", scheduleUiStateSave);
+agentModelInput?.addEventListener("input", scheduleUiStateSave);
+ragModelInput?.addEventListener("input", scheduleUiStateSave);
 userModeBtn?.addEventListener("click", () => {
   if (uiMode === "user") {
     return;

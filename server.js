@@ -24,6 +24,7 @@ const OLLAMA_NON_STREAM_TIMEOUT_MS = Number(process.env.OLLAMA_NON_STREAM_TIMEOU
 const DEFAULT_SEARCH_QUERY = process.env.DEFAULT_SEARCH_QUERY || "papa leone";
 const DEFAULT_LIMIT = Number(process.env.DEFAULT_LIMIT || 5);
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "gemma:7b";
+const DEFAULT_AGENT_MODEL = process.env.DEFAULT_AGENT_MODEL || process.env.AGENT_MODEL || DEFAULT_MODEL;
 const MAX_TEXT_EXCERPT_CHARS = Number(process.env.MAX_TEXT_EXCERPT_CHARS || 1800);
 const MAX_CONTEXT_DOCS = Number(process.env.MAX_CONTEXT_DOCS || 3);
 const SEARCH_CANDIDATE_MULTIPLIER = Number(process.env.SEARCH_CANDIDATE_MULTIPLIER || 3);
@@ -44,18 +45,18 @@ const SEARCH_PROFILES = {
 const AI_ENTITY_FALLBACK_ENABLED = process.env.AI_ENTITY_FALLBACK_ENABLED !== "false";
 const AI_ENTITY_MIN_LOCAL_TERMS = Number(process.env.AI_ENTITY_MIN_LOCAL_TERMS || 3);
 const AI_ENTITY_TIMEOUT_MS = Number(process.env.AI_ENTITY_TIMEOUT_MS || 1800);
-const AI_ENTITY_MODEL = process.env.AI_ENTITY_MODEL || DEFAULT_MODEL;
+const AI_ENTITY_MODEL = process.env.AI_ENTITY_MODEL || DEFAULT_AGENT_MODEL;
 const AI_ENTITY_CACHE_TTL_MS = 60_000;
 const AI_INTENT_ENABLED = process.env.AI_INTENT_ENABLED !== "false";
-const AI_INTENT_MODEL = process.env.AI_INTENT_MODEL || AI_ENTITY_MODEL;
+const AI_INTENT_MODEL = process.env.AI_INTENT_MODEL || DEFAULT_AGENT_MODEL;
 const AI_INTENT_TIMEOUT_MS = Number(process.env.AI_INTENT_TIMEOUT_MS || 2200);
 const AI_INTENT_CACHE_TTL_MS = Number(process.env.AI_INTENT_CACHE_TTL_MS || 45_000);
 const AI_QUERY_REWRITE_ENABLED = process.env.AI_QUERY_REWRITE_ENABLED !== "false";
-const AI_QUERY_REWRITE_MODEL = process.env.AI_QUERY_REWRITE_MODEL || AI_INTENT_MODEL;
+const AI_QUERY_REWRITE_MODEL = process.env.AI_QUERY_REWRITE_MODEL || DEFAULT_AGENT_MODEL;
 const AI_QUERY_REWRITE_TIMEOUT_MS = Number(process.env.AI_QUERY_REWRITE_TIMEOUT_MS || 2600);
 const AI_QUERY_REWRITE_CACHE_TTL_MS = Number(process.env.AI_QUERY_REWRITE_CACHE_TTL_MS || 60_000);
 const AI_TOPIC_RELATION_ENABLED = process.env.AI_TOPIC_RELATION_ENABLED !== "false";
-const AI_TOPIC_RELATION_MODEL = process.env.AI_TOPIC_RELATION_MODEL || AI_QUERY_REWRITE_MODEL;
+const AI_TOPIC_RELATION_MODEL = process.env.AI_TOPIC_RELATION_MODEL || DEFAULT_AGENT_MODEL;
 const AI_TOPIC_RELATION_TIMEOUT_MS = Number(process.env.AI_TOPIC_RELATION_TIMEOUT_MS || 1800);
 const AI_TOPIC_RELATION_CACHE_TTL_MS = Number(process.env.AI_TOPIC_RELATION_CACHE_TTL_MS || 60_000);
 const AI_TOPIC_RELATION_CONFIDENCE_THRESHOLD = Number(
@@ -156,6 +157,26 @@ Regole:
 - non usare conoscenze esterne
 - non inventare fatti
 - usa solo il contesto fornito`;
+const BOLLETTINO_PROMPT_TEMPLATE = `Sei un esperto in notizie che riguardano il Vaticano e la Chiesa
+Usa solo il contesto seguente.
+
+Contesto:
+{{context}}
+
+Domanda:
+{{question}}
+
+Offri una risposta completa, esauriente, dettagliata, offrendo quante piu' informazioni possibili in maniera ordinata.
+La risposta deve essere lunga e articolata.
+Rispondi solo sull'argomento richiesto da utente, anche se hai altre notizie nel contesto.
+Alla fine della risposta inserisci il link alla pagina da cui e' stata estratta la notizia. Il link deve essere completo.
+Se i dati non sono sufficienti afferma chiaramente che non puoi rispondere in modo fondato.
+
+Regole:
+- non usare conoscenze esterne
+- non inventare fatti
+- usa solo il contesto fornito
+- se il modello produce tag <think>, mostra comunque i passaggi in chiaro come testo normale`;
 const DEFAULT_AGENT_PROMPT_TEMPLATE = `Classifica l'intento di una richiesta utente per preparare ricerca documentale.
 Restituisci SOLO JSON valido con schema:
 {"needsTopic":boolean,"needsTime":boolean,"confidence":number}
@@ -451,8 +472,185 @@ function normalizeEntityPayload(payload) {
   };
 }
 
+function escapeFilterValue(value) {
+  return String(value || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .trim();
+}
+
+function buildFieldFilterExpression(fieldName, values) {
+  const items = normalizeEntityValues(values);
+  if (items.length === 0) {
+    return "";
+  }
+
+  if (items.length === 1) {
+    return `${fieldName} = "${escapeFilterValue(items[0])}"`;
+  }
+
+  return `(${items.map((value) => `${fieldName} = "${escapeFilterValue(value)}"`).join(" OR ")})`;
+}
+
+function normalizeTemporalRangePayload(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const start = String(value.start || "").trim();
+  const end = String(value.end || "").trim();
+  const precision = String(value.precision || "").trim() || "custom";
+
+  if (!start || !end || !isIsoDateString(start) || !isIsoDateString(end)) {
+    return null;
+  }
+
+  return { start, end, precision };
+}
+
+function normalizeSearchPlanPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const source = payload;
+  const filters = source.filters && typeof source.filters === "object" ? source.filters : {};
+  const temporalRange = normalizeTemporalRangePayload(filters.data || source.temporalRange);
+  const persone = normalizeEntityValues(filters.persone);
+  const luoghi = normalizeEntityValues(filters.luoghi);
+  const enti = normalizeEntityValues(filters.enti);
+  const filterClauses = [
+    temporalRange ? buildTemporalFilter(temporalRange) : "",
+    buildFieldFilterExpression("persone", persone),
+    buildFieldFilterExpression("luoghi", luoghi),
+    buildFieldFilterExpression("enti", enti),
+  ].filter(Boolean);
+
+  return {
+    question: String(source.question || "").trim(),
+    textQuery: String(source.textQuery || source.searchQuery || "").trim(),
+    filters: {
+      data: temporalRange,
+      persone,
+      luoghi,
+      enti,
+    },
+    filterExpression: filterClauses.join(" AND "),
+    debug: source.debug && typeof source.debug === "object" ? source.debug : {},
+  };
+}
+
+function buildSearchPlan({ question, searchQuery, analysis, debug = {} }) {
+  const textQuery = String(searchQuery || "").trim();
+  const temporalRange = parseTemporalRange(question);
+  const entities = normalizeEntityPayload(analysis?.entities);
+  const filterClauses = [
+    temporalRange ? buildTemporalFilter(temporalRange) : "",
+    buildFieldFilterExpression("persone", entities.persone),
+    buildFieldFilterExpression("luoghi", entities.luoghi),
+    buildFieldFilterExpression("enti", entities.enti),
+  ].filter(Boolean);
+
+  return {
+    question: String(question || "").trim(),
+    textQuery,
+    filters: {
+      data: temporalRange,
+      persone: entities.persone,
+      luoghi: entities.luoghi,
+      enti: entities.enti,
+    },
+    filterExpression: filterClauses.join(" AND "),
+    debug,
+  };
+}
+
+function hitMatchesFieldFilter(hit, fieldName, values) {
+  const filterValues = normalizeEntityValues(values).map((value) => normalizeText(value));
+  if (filterValues.length === 0) {
+    return true;
+  }
+
+  const hitValues = (Array.isArray(hit?.[fieldName]) ? hit[fieldName] : [])
+    .map((value) => normalizeText(value))
+    .filter(Boolean);
+
+  if (hitValues.length === 0) {
+    return false;
+  }
+
+  return filterValues.some((value) => hitValues.includes(value));
+}
+
+function hitMatchesSearchPlan(hit, searchPlan) {
+  const plan = normalizeSearchPlanPayload(searchPlan);
+  if (!plan) {
+    return true;
+  }
+
+  if (plan.filters.data && !hitInTemporalRange(hit, plan.filters.data)) {
+    return false;
+  }
+
+  if (!hitMatchesFieldFilter(hit, "persone", plan.filters.persone)) {
+    return false;
+  }
+
+  if (!hitMatchesFieldFilter(hit, "luoghi", plan.filters.luoghi)) {
+    return false;
+  }
+
+  if (!hitMatchesFieldFilter(hit, "enti", plan.filters.enti)) {
+    return false;
+  }
+
+  return true;
+}
+
 function normalizeApostrophes(value) {
   return String(value || "").replace(/[’']/g, " ");
+}
+
+function extractCapitalizedPhrases(text) {
+  const raw = String(text || "").trim();
+  if (!raw) {
+    return [];
+  }
+
+  const matches = raw.match(/\b[A-ZÀ-ÖØ-Ý][\p{L}À-ÖØ-öø-ÿ.'’-]*(?:\s+(?:[A-ZÀ-ÖØ-Ý][\p{L}À-ÖØ-öø-ÿ.'’-]*|[IVXLCDM]+)){0,4}/gu) || [];
+  return uniqueTerms(
+    matches
+      .map((value) => String(value || "").trim())
+      .filter((value) => value.length >= 3)
+      .filter((value) => !/^(Cosa|Che|Come|Quando|Dove|Quale|Quali|Nel|Nella|Nello|Nei|Negli|Nelle|Il|La|Lo|I|Gli|Le)$/u.test(value))
+  );
+}
+
+function extractLocalEntities(question) {
+  const phrases = extractCapitalizedPhrases(question);
+  const entities = {
+    persone: [],
+    luoghi: [],
+    enti: [],
+  };
+
+  for (const phrase of phrases) {
+    if (/\b(Basilica|Citta|Città|Roma|Gerusalemme|Betlemme|Assisi|Vaticano)\b/u.test(phrase)) {
+      entities.luoghi.push(phrase);
+      continue;
+    }
+
+    if (/\b(Dicastero|Banco|Banca|Conferenza|Chiesa|Vaticano|Elemosineria|Pontificia|Santa Sede)\b/u.test(phrase)) {
+      entities.enti.push(phrase);
+      continue;
+    }
+
+    if (/\b([IVXLCDM]+)\b/u.test(phrase) || phrase.split(/\s+/).length >= 2) {
+      entities.persone.push(phrase);
+    }
+  }
+
+  return normalizeEntityPayload(entities);
 }
 
 function toIsoDate(year, month, day) {
@@ -576,14 +774,15 @@ function getSearchProfile(searchIndex) {
   return SEARCH_PROFILES[normalizedIndex] || SEARCH_PROFILES[DEFAULT_SEARCH_INDEX] || SEARCH_PROFILES.testi_ecclesiali;
 }
 
-async function inferIntentRequirementsWithAi({ question, history, strictTemporal, promptTemplate }) {
+async function inferIntentRequirementsWithAi({ question, history, strictTemporal, promptTemplate, model }) {
   if (!AI_INTENT_ENABLED) {
     return null;
   }
 
   const historyText = getUserHistoryText(history);
   const merged = [historyText, String(question || "").trim()].filter(Boolean).join(" ");
-  const cacheKey = `intent::${strictTemporal ? "strict" : "relaxed"}::${normalizeText(merged)}`;
+  const resolvedModel = String(model || AI_INTENT_MODEL || DEFAULT_AGENT_MODEL).trim() || DEFAULT_AGENT_MODEL;
+  const cacheKey = `intent::${resolvedModel}::${strictTemporal ? "strict" : "relaxed"}::${normalizeText(merged)}`;
   const now = Date.now();
   const cached = intentAnalysisCache.get(cacheKey);
   if (cached && now - cached.timestamp < AI_INTENT_CACHE_TTL_MS) {
@@ -597,7 +796,7 @@ async function inferIntentRequirementsWithAi({ question, history, strictTemporal
     .replaceAll("{{question}}", String(question || "").trim());
 
   try {
-    const raw = await askOllamaWithTimeout(prompt, AI_INTENT_MODEL, AI_INTENT_TIMEOUT_MS);
+    const raw = await askOllamaWithTimeout(prompt, resolvedModel, AI_INTENT_TIMEOUT_MS);
     const parsed = extractJsonObject(raw);
     if (!parsed || typeof parsed !== "object") {
       return null;
@@ -624,26 +823,25 @@ async function inferIntentRequirementsWithAi({ question, history, strictTemporal
   }
 }
 
-async function rewriteSearchQueryWithAi({ question, history, previousSources, previousAnswer, promptTemplate }) {
+async function rewriteSearchQueryWithAi({ question, history, previousSources, promptTemplate, model }) {
   if (!AI_QUERY_REWRITE_ENABLED) {
     return null;
   }
 
+  const resolvedModel = String(model || AI_QUERY_REWRITE_MODEL || DEFAULT_AGENT_MODEL).trim() || DEFAULT_AGENT_MODEL;
   const template = String(promptTemplate || DEFAULT_QUERY_REWRITE_TEMPLATE);
   const historyText = getUserHistoryText(history);
   const sourcesText = formatPreviousSourcesForPrompt(previousSources);
-  const previousAnswerText = String(previousAnswer || "").trim();
   const rewriteHistoryText = [
     historyText,
-    previousAnswerText ? `Risposta assistente precedente:\n${previousAnswerText}` : "",
     `Fonti recenti:\n${sourcesText}`,
   ]
     .filter(Boolean)
     .join("\n\n");
-  const cacheSource = [historyText, previousAnswerText, sourcesText, String(question || "").trim()]
+  const cacheSource = [historyText, sourcesText, String(question || "").trim()]
     .filter(Boolean)
     .join(" ");
-  const cacheKey = `rewrite::${normalizeText(template)}::${normalizeText(cacheSource)}`;
+  const cacheKey = `rewrite::${resolvedModel}::${normalizeText(template)}::${normalizeText(cacheSource)}`;
   const now = Date.now();
   const cached = queryRewriteCache.get(cacheKey);
   if (cached && now - cached.timestamp < AI_QUERY_REWRITE_CACHE_TTL_MS) {
@@ -655,7 +853,7 @@ async function rewriteSearchQueryWithAi({ question, history, previousSources, pr
     .replaceAll("{{question}}", String(question || "").trim());
 
   try {
-    const raw = await askOllamaWithTimeout(prompt, AI_QUERY_REWRITE_MODEL, AI_QUERY_REWRITE_TIMEOUT_MS);
+    const raw = await askOllamaWithTimeout(prompt, resolvedModel, AI_QUERY_REWRITE_TIMEOUT_MS);
     const parsed = extractJsonObject(raw);
     if (!parsed || typeof parsed !== "object") {
       return null;
@@ -693,6 +891,7 @@ async function getTemporalDisambiguation(question, options = {}) {
     question,
     history: options.history || [],
     strictTemporal: true,
+    model: options.agentModel,
   });
 
   const ruleTimeSensitive =
@@ -724,14 +923,21 @@ function buildLocalQuestionAnalysis(question) {
   const normalizedQuestion = normalizeText(question);
   const baseTerms = tokenizeSignificant(normalizeApostrophes(question));
   const terms = uniqueTerms(baseTerms);
+  const localEntities = extractLocalEntities(question);
+  const entityTerms = uniqueTerms(
+    [...localEntities.persone, ...localEntities.luoghi, ...localEntities.enti].flatMap((value) =>
+      tokenizeSignificant(normalizeApostrophes(value))
+    )
+  );
+  const mergedTerms = uniqueTerms([...terms, ...entityTerms]);
 
   return {
     original: String(question || "").trim(),
     normalized: normalizedQuestion,
-    terms,
-    entities: { persone: [], luoghi: [], enti: [] },
+    terms: mergedTerms,
+    entities: localEntities,
     usedAiEntityFallback: false,
-    retrievalQuery: terms.length > 0 ? terms.join(" ") : String(question || "").trim(),
+    retrievalQuery: mergedTerms.length > 0 ? mergedTerms.join(" ") : String(question || "").trim(),
   };
 }
 
@@ -781,12 +987,13 @@ async function askOllamaWithTimeout(prompt, model, timeoutMs) {
   }
 }
 
-async function extractEntitiesWithAi(question) {
+async function extractEntitiesWithAi(question, model) {
   if (!AI_ENTITY_FALLBACK_ENABLED) {
     return null;
   }
 
-  const cacheKey = normalizeText(question);
+  const resolvedModel = String(model || AI_ENTITY_MODEL || DEFAULT_AGENT_MODEL).trim() || DEFAULT_AGENT_MODEL;
+  const cacheKey = `${resolvedModel}::${normalizeText(question)}`;
   const now = Date.now();
   const cached = questionAnalysisCache.get(cacheKey);
   if (cached && now - cached.timestamp < AI_ENTITY_CACHE_TTL_MS) {
@@ -805,7 +1012,7 @@ Regole:
 Domanda: ${String(question || "").trim()}`;
 
   try {
-    const raw = await askOllamaWithTimeout(extractionPrompt, AI_ENTITY_MODEL, AI_ENTITY_TIMEOUT_MS);
+    const raw = await askOllamaWithTimeout(extractionPrompt, resolvedModel, AI_ENTITY_TIMEOUT_MS);
     const parsed = extractJsonObject(raw);
     if (!parsed) {
       return null;
@@ -822,13 +1029,14 @@ Domanda: ${String(question || "").trim()}`;
   }
 }
 
-async function analyzeQuestion(question) {
+async function analyzeQuestion(question, options = {}) {
   const local = buildLocalQuestionAnalysis(question);
-  if (local.terms.length >= AI_ENTITY_MIN_LOCAL_TERMS) {
+  const shouldForceAiEntities = Boolean(options.forceAiEntities);
+  if (local.terms.length >= AI_ENTITY_MIN_LOCAL_TERMS && !shouldForceAiEntities) {
     return local;
   }
 
-  const aiEntities = await extractEntitiesWithAi(question);
+  const aiEntities = await extractEntitiesWithAi(question, options.agentModel);
   if (!aiEntities) {
     return local;
   }
@@ -844,7 +1052,11 @@ async function analyzeQuestion(question) {
   return {
     ...local,
     terms: mergedTerms,
-    entities: aiEntities,
+    entities: normalizeEntityPayload({
+      persone: [...(local.entities?.persone || []), ...aiEntities.persone],
+      luoghi: [...(local.entities?.luoghi || []), ...aiEntities.luoghi],
+      enti: [...(local.entities?.enti || []), ...aiEntities.enti],
+    }),
     usedAiEntityFallback: true,
     retrievalQuery,
   };
@@ -994,8 +1206,9 @@ async function runSearchQuery(query, limit, searchIndex, options = {}) {
   const apiKey = getSearchApiKey(searchIndex);
   const normalizedIndex = normalizeSearchIndex(searchIndex);
   const temporalFilter = buildTemporalFilter(options.temporalRange);
+  const filterExpression = String(options.filterExpression || temporalFilter || "").trim();
   const indexDataFilterability = dataFilterabilityCache.get(normalizedIndex);
-  const shouldAttemptServerDateFilter = Boolean(temporalFilter) && indexDataFilterability !== false;
+  const shouldAttemptServerDateFilter = Boolean(filterExpression) && indexDataFilterability !== false;
 
   if (!apiKey) {
     throw new Error("SEARCH_API_KEY non configurata per l'indice richiesto");
@@ -1010,7 +1223,7 @@ async function runSearchQuery(query, limit, searchIndex, options = {}) {
     body: JSON.stringify({
       q: query,
       limit,
-      ...(shouldAttemptServerDateFilter ? { filter: temporalFilter } : {}),
+      ...(shouldAttemptServerDateFilter ? { filter: filterExpression } : {}),
     }),
   });
 
@@ -1019,8 +1232,7 @@ async function runSearchQuery(query, limit, searchIndex, options = {}) {
     const canFallbackToLocalDateFilter =
       shouldAttemptServerDateFilter
       && searchResponse.status === 400
-      && /not filterable/i.test(text)
-      && /\bdata\b/i.test(text);
+      && /not filterable/i.test(text);
 
     if (canFallbackToLocalDateFilter) {
       dataFilterabilityCache.set(normalizedIndex, false);
@@ -1051,11 +1263,17 @@ async function runSearchQuery(query, limit, searchIndex, options = {}) {
   const hits = Array.isArray(payload?.hits) ? payload.hits : [];
   const qualityHits = hits.filter((hit) => !isLowQualityHit(hit));
 
-  if (!options.temporalRange) {
+  if (!options.temporalRange && !options.searchPlan) {
     return qualityHits;
   }
 
-  return qualityHits.filter((hit) => hitInTemporalRange(hit, options.temporalRange));
+  return qualityHits.filter((hit) => {
+    if (options.searchPlan) {
+      return hitMatchesSearchPlan(hit, options.searchPlan);
+    }
+
+    return hitInTemporalRange(hit, options.temporalRange);
+  });
 }
 
 async function runSeedSearchCandidates(searchQuery, analysis, candidateLimit, searchIndex, options = {}) {
@@ -1374,9 +1592,10 @@ function getDefaultUiState(scope = UI_STATE_SCOPE_DEFAULT) {
   return {
     uiMode: "user",
     limit: DEFAULT_LIMIT,
-    model: DEFAULT_MODEL,
+    ragModel: DEFAULT_MODEL,
+    agentModel: DEFAULT_AGENT_MODEL,
     chatMode: profile.defaultChatMode,
-    promptTemplate: DEFAULT_PROMPT_TEMPLATE,
+    promptTemplate: scope === "bollettini" ? BOLLETTINO_PROMPT_TEMPLATE : DEFAULT_PROMPT_TEMPLATE,
     agentPromptTemplate: DEFAULT_AGENT_PROMPT_TEMPLATE,
     questionDraft: "",
   };
@@ -1397,7 +1616,10 @@ function sanitizeUiState(rawState, scope = UI_STATE_SCOPE_DEFAULT) {
   return {
     uiMode,
     limit: Number.isFinite(parsedLimit) ? parsedLimit : defaults.limit,
-    model: String(rawState?.model || defaults.model).trim() || defaults.model,
+    ragModel:
+      String(rawState?.ragModel || rawState?.model || defaults.ragModel).trim() || defaults.ragModel,
+    agentModel:
+      String(rawState?.agentModel || rawState?.model || defaults.agentModel).trim() || defaults.agentModel,
     chatMode,
     promptTemplate:
       String(rawState?.promptTemplate || defaults.promptTemplate) || defaults.promptTemplate,
@@ -1614,25 +1836,36 @@ function appendCanonicalSourceLinks(answer, hits) {
   return `${String(answer || "").trim()}\n${suffix}`.trim();
 }
 
-async function fetchContext(searchQuery, limit, searchIndex) {
+async function fetchContext(searchQuery, limit, searchIndex, options = {}) {
   if (!getSearchApiKey(searchIndex)) {
     throw new Error("SEARCH_API_KEY non configurata per l'indice richiesto");
   }
 
-  const analysis = await analyzeQuestion(searchQuery);
-  const temporalRange = parseTemporalRange(searchQuery);
+  const normalizedSearchPlan = normalizeSearchPlanPayload(options.searchPlan);
+  const analysisSeedQuestion = String(options.analysisQuestion || searchQuery || "").trim();
+  const effectiveSearchQuery = String(
+    normalizedSearchPlan?.textQuery
+    || searchQuery
+    || analysisSeedQuestion
+  ).trim();
+  const analysis = await analyzeQuestion(analysisSeedQuestion || effectiveSearchQuery);
+  const temporalRange = normalizedSearchPlan?.filters?.data || parseTemporalRange(analysisSeedQuestion || effectiveSearchQuery);
   const candidateLimit = Math.max(limit, Math.min(limit * SEARCH_CANDIDATE_MULTIPLIER, 15));
 
   // Pass 1: collect candidate documents to discover saved entities in the index.
   const seedCandidates = await runSeedSearchCandidates(
-    searchQuery,
+    effectiveSearchQuery,
     analysis,
     candidateLimit,
     searchIndex,
-    { temporalRange }
+    {
+      temporalRange,
+      filterExpression: normalizedSearchPlan?.filterExpression,
+      searchPlan: normalizedSearchPlan,
+    }
   );
-  const entitySignal = buildEntityAwareSignal(seedCandidates, searchQuery);
-  const retrievalQuery = entitySignal.retrievalTerms.join(" ");
+  const entitySignal = buildEntityAwareSignal(seedCandidates, analysisSeedQuestion || effectiveSearchQuery);
+  const retrievalQuery = effectiveSearchQuery || entitySignal.retrievalTerms.join(" ");
 
   // Pass 2: retrieval over composed query + focused term queries to avoid
   // losing multi-intent requests (e.g. "floreria" + "pizzaballa").
@@ -1649,7 +1882,11 @@ async function fetchContext(searchQuery, limit, searchIndex) {
 
   const perQueryLimit = Math.max(3, Math.ceil(candidateLimit / 2));
   const queryResults = await Promise.all(
-    expandedQueries.map((q) => runSearchQuery(q, perQueryLimit, searchIndex, { temporalRange }))
+    expandedQueries.map((q) => runSearchQuery(q, perQueryLimit, searchIndex, {
+      temporalRange,
+      filterExpression: normalizedSearchPlan?.filterExpression,
+      searchPlan: normalizedSearchPlan,
+    }))
   );
 
   const candidateHits = dedupeHitsWithCap(
@@ -1712,16 +1949,19 @@ async function fetchContext(searchQuery, limit, searchIndex) {
     retrievalQuery,
     detectedEntities: mergedEntities,
     entityKeywordTerms: liveEntitySignal.entityKeywordTerms,
+    searchPlan: normalizedSearchPlan,
   };
 }
 
-function getCacheKey(searchQuery, limit) {
-  return `${limit}::${searchQuery.trim().toLowerCase()}`;
+function getCacheKey(searchQuery, limit, searchPlan) {
+  const normalizedPlan = normalizeSearchPlanPayload(searchPlan);
+  const serializedPlan = normalizedPlan ? JSON.stringify(normalizedPlan) : "";
+  return `${limit}::${searchQuery.trim().toLowerCase()}::${serializedPlan}`;
 }
 
-async function fetchContextCached(searchQuery, limit, searchIndex) {
+async function fetchContextCached(searchQuery, limit, searchIndex, options = {}) {
   const normalizedIndex = normalizeSearchIndex(searchIndex);
-  const cacheKey = `${normalizedIndex}::${getCacheKey(searchQuery, limit)}`;
+  const cacheKey = `${normalizedIndex}::${getCacheKey(searchQuery, limit, options.searchPlan)}`;
   const now = Date.now();
   const cachedEntry = searchCache.get(cacheKey);
 
@@ -1729,7 +1969,7 @@ async function fetchContextCached(searchQuery, limit, searchIndex) {
     return { ...cachedEntry.payload, cached: true };
   }
 
-  const payload = await fetchContext(searchQuery, limit, normalizedIndex);
+  const payload = await fetchContext(searchQuery, limit, normalizedIndex, options);
   searchCache.set(cacheKey, {
     timestamp: now,
     payload,
@@ -1880,6 +2120,24 @@ function stripTopicDirectivePhrases(question) {
     .trim();
 }
 
+function stripTopicDirectivePhrasesPreserveCase(question) {
+  const raw = String(question || "").trim();
+  if (!raw) {
+    return "";
+  }
+
+  return raw
+    .replace(/\b(si|sì)\s+cambio\s+argomento\b/giu, "")
+    .replace(/\b(cambio|cambiare)\s+argomento\b/giu, "")
+    .replace(/\bno\s+continua\s+sullo\s+stesso\s+argomento\b/giu, "")
+    .replace(/\bcontinua\s+sullo\s+stesso\s+argomento\b/giu, "")
+    .replace(/\bstesso\s+argomento\b/giu, "")
+    .replace(/\bcercavo\s+altro\b/giu, "")
+    .replace(/[,:;]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function shouldAskTopicConfirmation(question, relationPayload, hasAnchor) {
   if (!hasAnchor || !relationPayload) {
     return false;
@@ -1895,7 +2153,7 @@ function shouldAskTopicConfirmation(question, relationPayload, hasAnchor) {
   return (unclear || lowConfidence) && shortQuestion && (vagueFollowUp || !hasTopicReference(question));
 }
 
-async function inferTopicRelationWithAi({ question, history, previousSources }) {
+async function inferTopicRelationWithAi({ question, history, previousSources, model }) {
   if (!AI_TOPIC_RELATION_ENABLED) {
     return null;
   }
@@ -1913,7 +2171,8 @@ async function inferTopicRelationWithAi({ question, history, previousSources }) 
     return null;
   }
 
-  const cacheKey = `topic-relation::${normalizeText(lastQuestion)}::${normalizeText(previousSourcesText)}::${normalizeText(currentQuestion)}`;
+  const resolvedModel = String(model || AI_TOPIC_RELATION_MODEL || DEFAULT_AGENT_MODEL).trim() || DEFAULT_AGENT_MODEL;
+  const cacheKey = `topic-relation::${resolvedModel}::${normalizeText(lastQuestion)}::${normalizeText(previousSourcesText)}::${normalizeText(currentQuestion)}`;
   const now = Date.now();
   const cached = topicRelationCache.get(cacheKey);
   if (cached && now - cached.timestamp < AI_TOPIC_RELATION_CACHE_TTL_MS) {
@@ -1928,7 +2187,7 @@ async function inferTopicRelationWithAi({ question, history, previousSources }) 
   try {
     const raw = await askOllamaWithTimeout(
       prompt,
-      AI_TOPIC_RELATION_MODEL,
+      resolvedModel,
       AI_TOPIC_RELATION_TIMEOUT_MS
     );
     const parsed = extractJsonObject(raw);
@@ -2074,6 +2333,93 @@ function hasNonTemporalTopicOverlap(textA, textB) {
   return tokensA.some((token) => tokenSetB.has(token));
 }
 
+function buildQuestionSourceSupport(question, previousSources) {
+  if (!Array.isArray(previousSources) || previousSources.length === 0) {
+    return {
+      hasSupport: false,
+      matchedSources: [],
+      sourceAnchorText: "",
+    };
+  }
+
+  const sourceRows = previousSources
+    .slice(0, 8)
+    .map((item) => {
+      const titolo = String(item?.titolo || "").trim();
+      const fonte = String(item?.fonte || "").trim();
+      const data = String(item?.data || "").trim();
+      const link = String(item?.link || "").trim();
+      const text = [titolo, fonte, data].filter(Boolean).join(" ");
+      return {
+        titolo,
+        fonte,
+        data,
+        link,
+        text,
+      };
+    })
+    .filter((row) => row.text);
+
+  if (sourceRows.length === 0) {
+    return {
+      hasSupport: false,
+      matchedSources: [],
+      sourceAnchorText: "",
+    };
+  }
+
+  const matchedSources = sourceRows.filter((row) => hasNonTemporalTopicOverlap(question, row.text));
+
+  return {
+    hasSupport: matchedSources.length > 0,
+    matchedSources: matchedSources.slice(0, 4),
+    sourceAnchorText: sourceRows.map((row) => row.text).join(" "),
+  };
+}
+
+function buildResearchJson({ question, searchQuery, analysis, sourceSupport, intentRelation, stage }) {
+  const temporalRange = parseTemporalRange(question);
+  const terms = Array.isArray(analysis?.terms) ? analysis.terms.slice(0, 18) : [];
+  const entities = normalizeEntityPayload(analysis?.entities);
+  const searchPlan = buildSearchPlan({
+    question,
+    searchQuery,
+    analysis,
+    debug: {
+      relation: intentRelation?.relation || "unclear",
+      relationConfidence: Number(intentRelation?.confidence || 0),
+      sourceSupport: Boolean(sourceSupport?.hasSupport),
+    },
+  });
+  const matchedSources = Array.isArray(sourceSupport?.matchedSources)
+    ? sourceSupport.matchedSources.map((item) => ({
+      titolo: item?.titolo || "",
+      fonte: item?.fonte || "",
+      data: item?.data || "",
+      link: item?.link || "",
+    }))
+    : [];
+
+  return {
+    stage,
+    question: String(question || "").trim(),
+    searchQuery: String(searchQuery || "").trim(),
+    entities,
+    terms,
+    temporalRange,
+    searchPlan,
+    intent: {
+      relation: intentRelation?.relation || "unclear",
+      confidence: Number(intentRelation?.confidence || 0),
+    },
+    sourceSupport: {
+      hasSupport: Boolean(sourceSupport?.hasSupport),
+      matchedSources,
+      sourceCount: Array.isArray(sourceSupport?.matchedSources) ? sourceSupport.matchedSources.length : 0,
+    },
+  };
+}
+
 function hasOnlyTemporalIntent(text) {
   const tokens = uniqueTerms(tokenizeIntent(normalizeApostrophes(text)));
   if (tokens.length === 0) {
@@ -2120,50 +2466,34 @@ function buildProposedSearchQuery(text) {
   return terms.join(" ");
 }
 
-async function buildIntakeDecision({ question, history, previousSources, profile, agentPromptTemplate }) {
+async function buildIntakeDecision({ question, history, previousSources, profile, agentPromptTemplate, agentModel }) {
   const originalQuestionText = String(question || "").trim();
-  const currentQuestionText = stripTopicDirectivePhrases(originalQuestionText) || originalQuestionText;
+  const currentQuestionText = stripTopicDirectivePhrasesPreserveCase(originalQuestionText) || originalQuestionText;
   const explicitDirective = detectTopicSwitchDirective(originalQuestionText);
-  const previousAnswerText = getLastAssistantAnswer(history);
-  const followUpFromAnswer = await inferFollowUpFromPreviousAnswerWithAi({
+  const resolvedAgentModel = String(agentModel || "").trim() || DEFAULT_AGENT_MODEL;
+  const relationPayload = await inferTopicRelationWithAi({
     question: currentQuestionText,
     history,
     previousSources,
+    model: resolvedAgentModel,
   });
+  const sourceSupport = buildQuestionSourceSupport(currentQuestionText, previousSources);
 
-  // Priority order:
-  // 1) explicit user directive;
-  // 2) semantic follow-up detection against previous assistant answer;
-  // 3) default to new topic.
   const keepConversationContext = explicitDirective === "same-topic"
     ? true
     : explicitDirective === "new-topic"
       ? false
       : Boolean(
-        (followUpFromAnswer?.isFollowUp && followUpFromAnswer?.confidence >= 0.6)
-        || inferFollowUpFromPreviousAnswerRules(currentQuestionText, history)
+        relationPayload?.relation === "same-topic"
+        && relationPayload?.confidence >= AI_TOPIC_RELATION_CONFIDENCE_THRESHOLD
       );
 
-  // If the requested detail is already present in previous assistant answer,
-  // respond directly from memory and avoid running a new search.
-  if (keepConversationContext && explicitDirective !== "new-topic") {
-    const memorySnippets = pickAnswerSnippetsFromPreviousAnswer(currentQuestionText, previousAnswerText);
-    if (memorySnippets.length > 0) {
-      return {
-        readyToSearch: false,
-        answer: memorySnippets.join(" "),
-        proposedSearchQuery: "",
-        missingFields: [],
-        stage: "answered-from-memory",
-      };
-    }
-  }
+  const mustRestartCycle = keepConversationContext && !sourceSupport.hasSupport;
 
   const effectiveHistory = keepConversationContext && Array.isArray(history) ? history : [];
   const effectiveHistoryText = getUserHistoryText(effectiveHistory);
-  const effectivePreviousAnswerText = keepConversationContext ? previousAnswerText : "";
   const effectiveSourcesText = keepConversationContext ? buildSourcesContextText(previousSources) : "";
-  const mergedText = [effectiveHistoryText, effectivePreviousAnswerText, effectiveSourcesText, currentQuestionText]
+  const mergedText = [effectiveHistoryText, effectiveSourcesText, currentQuestionText]
     .filter(Boolean)
     .join(" ");
 
@@ -2173,6 +2503,12 @@ async function buildIntakeDecision({ question, history, previousSources, profile
     history: effectiveHistory,
     strictTemporal,
     promptTemplate: agentPromptTemplate,
+    model: resolvedAgentModel,
+  });
+
+  const questionAnalysis = await analyzeQuestion(currentQuestionText, {
+    agentModel: resolvedAgentModel,
+    forceAiEntities: true,
   });
 
   const aiReliable = aiIntent && aiIntent.confidence >= 0.55;
@@ -2212,14 +2548,47 @@ async function buildIntakeDecision({ question, history, previousSources, profile
     missingFields.push("time");
   }
 
+  if (mustRestartCycle) {
+    const restartSearchQuery = buildProposedSearchQuery(currentQuestionText);
+    return {
+      readyToSearch: false,
+      answer:
+        "Nelle fonti dell'ultima risposta non trovo elementi utili per proseguire su questo follow-up. Riavvio il ciclo: indicami tema preciso e periodo.",
+      proposedSearchQuery: "",
+      missingFields: ["topic", ...(strictTemporal ? ["time"] : [])],
+      stage: "restart-cycle",
+      researchJson: buildResearchJson({
+        question: currentQuestionText,
+        searchQuery: restartSearchQuery,
+        analysis: questionAnalysis,
+        sourceSupport,
+        intentRelation: relationPayload,
+        stage: "restart-cycle",
+      }),
+      searchPlan: buildSearchPlan({
+        question: currentQuestionText,
+        searchQuery: restartSearchQuery,
+        analysis: questionAnalysis,
+        debug: {
+          resolvedTopicMode: keepConversationContext ? "same-topic" : "new-topic",
+          relation: relationPayload?.relation || "unclear",
+          relationConfidence: Number(relationPayload?.confidence || 0),
+          sourceSupport: Boolean(sourceSupport?.hasSupport),
+          restartCycle: true,
+        },
+      }),
+      agentModel: resolvedAgentModel,
+    };
+  }
+
   if (missingFields.length === 0) {
     const querySeedText = currentQuestionText;
     const aiRewrittenQuery = await rewriteSearchQueryWithAi({
       question: currentQuestionText,
-      history: [],
-      previousSources: [],
-      previousAnswer: "",
+      history: effectiveHistory,
+      previousSources: keepConversationContext ? previousSources : [],
       promptTemplate: DEFAULT_QUERY_REWRITE_TEMPLATE,
+      model: resolvedAgentModel,
     });
     const canUseAiRewrite = Boolean(
       aiRewrittenQuery?.searchQuery
@@ -2237,6 +2606,27 @@ async function buildIntakeDecision({ question, history, previousSources, profile
       proposedSearchQuery,
       missingFields: [],
       stage: "ready",
+      researchJson: buildResearchJson({
+        question: currentQuestionText,
+        searchQuery: proposedSearchQuery,
+        analysis: questionAnalysis,
+        sourceSupport,
+        intentRelation: relationPayload,
+        stage: "ready",
+      }),
+      searchPlan: buildSearchPlan({
+        question: currentQuestionText,
+        searchQuery: proposedSearchQuery,
+        analysis: questionAnalysis,
+        debug: {
+          resolvedTopicMode: keepConversationContext ? "same-topic" : "new-topic",
+          relation: relationPayload?.relation || "unclear",
+          relationConfidence: Number(relationPayload?.confidence || 0),
+          sourceSupport: Boolean(sourceSupport?.hasSupport),
+          restartCycle: false,
+        },
+      }),
+      agentModel: resolvedAgentModel,
     };
   }
 
@@ -2248,6 +2638,27 @@ async function buildIntakeDecision({ question, history, previousSources, profile
       proposedSearchQuery: "",
       missingFields,
       stage: "need-topic-and-time",
+      researchJson: buildResearchJson({
+        question: currentQuestionText,
+        searchQuery: buildProposedSearchQuery(currentQuestionText),
+        analysis: questionAnalysis,
+        sourceSupport,
+        intentRelation: relationPayload,
+        stage: "need-topic-and-time",
+      }),
+      searchPlan: buildSearchPlan({
+        question: currentQuestionText,
+        searchQuery: buildProposedSearchQuery(currentQuestionText),
+        analysis: questionAnalysis,
+        debug: {
+          resolvedTopicMode: keepConversationContext ? "same-topic" : "new-topic",
+          relation: relationPayload?.relation || "unclear",
+          relationConfidence: Number(relationPayload?.confidence || 0),
+          sourceSupport: Boolean(sourceSupport?.hasSupport),
+          restartCycle: false,
+        },
+      }),
+      agentModel: resolvedAgentModel,
     };
   }
 
@@ -2259,6 +2670,27 @@ async function buildIntakeDecision({ question, history, previousSources, profile
       proposedSearchQuery: "",
       missingFields,
       stage: "need-topic",
+      researchJson: buildResearchJson({
+        question: currentQuestionText,
+        searchQuery: buildProposedSearchQuery(currentQuestionText),
+        analysis: questionAnalysis,
+        sourceSupport,
+        intentRelation: relationPayload,
+        stage: "need-topic",
+      }),
+      searchPlan: buildSearchPlan({
+        question: currentQuestionText,
+        searchQuery: buildProposedSearchQuery(currentQuestionText),
+        analysis: questionAnalysis,
+        debug: {
+          resolvedTopicMode: keepConversationContext ? "same-topic" : "new-topic",
+          relation: relationPayload?.relation || "unclear",
+          relationConfidence: Number(relationPayload?.confidence || 0),
+          sourceSupport: Boolean(sourceSupport?.hasSupport),
+          restartCycle: false,
+        },
+      }),
+      agentModel: resolvedAgentModel,
     };
   }
 
@@ -2269,6 +2701,27 @@ async function buildIntakeDecision({ question, history, previousSources, profile
     proposedSearchQuery: "",
     missingFields,
     stage: "need-time",
+    researchJson: buildResearchJson({
+      question: currentQuestionText,
+      searchQuery: buildProposedSearchQuery(currentQuestionText),
+      analysis: questionAnalysis,
+      sourceSupport,
+      intentRelation: relationPayload,
+      stage: "need-time",
+    }),
+    searchPlan: buildSearchPlan({
+      question: currentQuestionText,
+      searchQuery: buildProposedSearchQuery(currentQuestionText),
+      analysis: questionAnalysis,
+      debug: {
+        resolvedTopicMode: keepConversationContext ? "same-topic" : "new-topic",
+        relation: relationPayload?.relation || "unclear",
+        relationConfidence: Number(relationPayload?.confidence || 0),
+        sourceSupport: Boolean(sourceSupport?.hasSupport),
+        restartCycle: false,
+      },
+    }),
+    agentModel: resolvedAgentModel,
   };
 }
 
@@ -2367,7 +2820,8 @@ app.post("/api/ui-state", async (req, res) => {
       ...currentState,
       uiMode: req.body?.uiMode,
       limit: req.body?.limit,
-      model: req.body?.model,
+      ragModel: req.body?.ragModel,
+      agentModel: req.body?.agentModel,
       chatMode: req.body?.chatMode,
       promptTemplate: req.body?.promptTemplate,
       agentPromptTemplate: req.body?.agentPromptTemplate,
@@ -2392,6 +2846,7 @@ app.post("/api/intake-chat", async (req, res) => {
     const previousSources = Array.isArray(req.body?.previousSources) ? req.body.previousSources : [];
     const uiScope = profile.key;
     const currentState = await readUiState(uiScope);
+    const agentModel = String(req.body?.agentModel || currentState.agentModel || "").trim() || DEFAULT_AGENT_MODEL;
 
     if (!question) {
       return res.status(400).json({ error: "La domanda e' obbligatoria." });
@@ -2403,6 +2858,7 @@ app.post("/api/intake-chat", async (req, res) => {
       previousSources,
       profile,
       agentPromptTemplate: currentState.agentPromptTemplate,
+      agentModel,
     });
     return res.json(decision);
   } catch (error) {
@@ -2415,6 +2871,7 @@ app.post("/api/intake-chat", async (req, res) => {
 app.post("/api/search-preview", async (req, res) => {
   try {
     const searchQuery = String(req.body?.searchQuery || "").trim();
+    const searchPlan = normalizeSearchPlanPayload(req.body?.searchPlan);
     const limit = Number(req.body?.limit || DEFAULT_LIMIT);
     const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
     const profile = getSearchProfile(searchIndex);
@@ -2454,7 +2911,11 @@ app.post("/api/search-preview", async (req, res) => {
       await fetchContextCached(
       searchQuery,
       limit,
-      searchIndex
+      searchIndex,
+      {
+        searchPlan,
+        analysisQuestion: String(req.body?.question || searchQuery || "").trim(),
+      }
     );
 
     return res.json({
@@ -2467,6 +2928,8 @@ app.post("/api/search-preview", async (req, res) => {
         cached,
         candidateCount,
         retrievalQuery: analysis?.retrievalQuery || searchQuery,
+        searchPlan,
+        activeFilter: searchPlan?.filterExpression || "",
         queryTerms: analysis?.terms || [],
         detectedEntities: detectedEntities || { persone: [], luoghi: [], enti: [] },
         entityKeywordTerms: entityKeywordTerms || [],
@@ -2485,11 +2948,14 @@ app.post("/api/rag", async (req, res) => {
   try {
     const question = String(req.body?.question || "").trim();
     const providedSearchQuery = String(req.body?.searchQuery || "").trim();
+    const searchPlan = normalizeSearchPlanPayload(req.body?.searchPlan);
     const searchQuery = providedSearchQuery || question || DEFAULT_SEARCH_QUERY;
     const limit = Number(req.body?.limit || DEFAULT_LIMIT);
     const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
     const profile = getSearchProfile(searchIndex);
-    const model = String(req.body?.model || DEFAULT_MODEL).trim();
+    const uiScope = profile.key;
+    const currentState = await readUiState(uiScope);
+    const model = String(req.body?.model || currentState.ragModel || "").trim() || DEFAULT_MODEL;
     const promptTemplate = String(req.body?.promptTemplate || "");
     const temporalDisambiguation = await getTemporalDisambiguation(question, {
       strict: profile.strictTemporalDisambiguation,
@@ -2522,12 +2988,10 @@ app.post("/api/rag", async (req, res) => {
       });
     }
 
-    const uiScope = profile.key;
-    const currentState = await readUiState(uiScope);
     await writeUiState({
       ...currentState,
       limit,
-      model,
+      ragModel: model,
       promptTemplate: promptTemplate || currentState.promptTemplate,
       questionDraft: question,
     }, uiScope);
@@ -2536,7 +3000,11 @@ app.post("/api/rag", async (req, res) => {
       await fetchContextCached(
       searchQuery,
       limit,
-      searchIndex
+      searchIndex,
+      {
+        searchPlan,
+        analysisQuestion: question,
+      }
     );
 
     if (!context) {
@@ -2552,6 +3020,8 @@ app.post("/api/rag", async (req, res) => {
           cached,
           candidateCount,
           retrievalQuery: analysis?.retrievalQuery || searchQuery,
+          searchPlan,
+          activeFilter: searchPlan?.filterExpression || "",
           queryTerms: analysis?.terms || [],
           detectedEntities: detectedEntities || { persone: [], luoghi: [], enti: [] },
           entityKeywordTerms: entityKeywordTerms || [],
@@ -2577,6 +3047,8 @@ app.post("/api/rag", async (req, res) => {
         cached,
         candidateCount,
         retrievalQuery: analysis?.retrievalQuery || searchQuery,
+        searchPlan,
+        activeFilter: searchPlan?.filterExpression || "",
         queryTerms: analysis?.terms || [],
         detectedEntities: detectedEntities || { persone: [], luoghi: [], enti: [] },
         entityKeywordTerms: entityKeywordTerms || [],
@@ -2599,11 +3071,14 @@ app.post("/api/rag-stream", async (req, res) => {
   try {
     const question = String(req.body?.question || "").trim();
     const providedSearchQuery = String(req.body?.searchQuery || "").trim();
+    const searchPlan = normalizeSearchPlanPayload(req.body?.searchPlan);
     const searchQuery = providedSearchQuery || question || DEFAULT_SEARCH_QUERY;
     const limit = Number(req.body?.limit || DEFAULT_LIMIT);
     const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
     const profile = getSearchProfile(searchIndex);
-    const model = String(req.body?.model || DEFAULT_MODEL).trim();
+    const uiScope = profile.key;
+    const currentState = await readUiState(uiScope);
+    const model = String(req.body?.model || currentState.ragModel || "").trim() || DEFAULT_MODEL;
     const promptTemplate = String(req.body?.promptTemplate || "");
     const temporalDisambiguation = await getTemporalDisambiguation(question, {
       strict: profile.strictTemporalDisambiguation,
@@ -2640,18 +3115,19 @@ app.post("/api/rag-stream", async (req, res) => {
       return res.end();
     }
 
-    const uiScope = profile.key;
-    const currentState = await readUiState(uiScope);
     await writeUiState({
       ...currentState,
       limit,
-      model,
+      ragModel: model,
       promptTemplate: promptTemplate || currentState.promptTemplate,
       questionDraft: question,
     }, uiScope);
 
     const { hits, context, cached, candidateCount, analysis, detectedEntities, entityKeywordTerms } =
-      await fetchContextCached(searchQuery, limit, searchIndex);
+      await fetchContextCached(searchQuery, limit, searchIndex, {
+        searchPlan,
+        analysisQuestion: question,
+      });
 
     const metadata = {
       model,
@@ -2661,6 +3137,8 @@ app.post("/api/rag-stream", async (req, res) => {
       cached,
       candidateCount,
       retrievalQuery: analysis?.retrievalQuery || searchQuery,
+      searchPlan,
+      activeFilter: searchPlan?.filterExpression || "",
       queryTerms: analysis?.terms || [],
       detectedEntities: detectedEntities || { persone: [], luoghi: [], enti: [] },
       entityKeywordTerms: entityKeywordTerms || [],

@@ -44,8 +44,13 @@
         </label>
 
         <label>
-          Modello Ollama
-          <input id="model" type="text" value="gemma:7b" />
+          Modello agente
+          <input id="agentModel" type="text" value="gemma:7b" />
+        </label>
+
+        <label>
+          Modello RAG
+          <input id="ragModel" type="text" value="gemma:7b" />
         </label>
 
         <label>
@@ -58,7 +63,9 @@
 
         <label id="promptTemplateBlock" class="full-width">
           Prompt template (usa {{context}} e {{question}})
-          <textarea id="promptTemplate" rows="12">Usa solo il contesto seguente.
+          <textarea id="promptTemplate" rows="12">Sei un esperto in notizie che riguardano il Vaticano e la Chiesa
+
+      Usa solo il contesto seguente.
 
 Contesto:
 {{context}}
@@ -66,35 +73,17 @@ Contesto:
 Domanda:
 {{question}}
 
-Scrivi la risposta con questa struttura:
-
-Sintesi iniziale:
-[3-4 frasi]
-
-Passaggi logici:
-1. ...
-2. ...
-3. ...
-
-Temi principali:
-- ...
-- ...
-- ...
-
-Evidenze dal contesto:
-- [fatto] (fonte, data)
-- [fatto] (fonte, data)
-
-Fonti:
-- ...
-
-Conclusione:
-[2-3 frasi]
+      Offri una risposta completa, esauriente, dettagliata, offrendo quante piu' informazioni possibili in maniera ordinata.
+      La risposta deve essere lunga e articolata.
+      Rispondi solo sull'argomento richiesto da utente, anche se hai altre notizie nel contesto.
+      Alla fine della risposta inserisci il link alla pagina da cui e' stata estratta la notizia. Il link deve essere completo.
+      Se i dati non sono sufficienti afferma chiaramente che non puoi rispondere in modo fondato.
 
 Regole:
 - non usare conoscenze esterne
 - non inventare fatti
-- usa solo il contesto fornito</textarea>
+      - usa solo il contesto fornito
+      - se il modello produce tag &lt;think&gt;, mostra comunque i passaggi in chiaro come testo normale</textarea>
         </label>
 
         <label id="agentPromptTemplateBlock" class="full-width">
