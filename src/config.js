@@ -48,7 +48,7 @@ export const AI_ENTITY_MODEL = process.env.AI_ENTITY_MODEL || DEFAULT_AGENT_MODE
 export const AI_ENTITY_CACHE_TTL_MS = 60_000;
 
 // Timeout per la singola call unificata dell'agente (sostituisce 5 call separate)
-export const AI_AGENT_TIMEOUT_MS = Number(process.env.AI_AGENT_TIMEOUT_MS || 5000);
+export const AI_AGENT_TIMEOUT_MS = Number(process.env.AI_AGENT_TIMEOUT_MS || 20_000);
 export const AI_AGENT_CACHE_TTL_MS = Number(process.env.AI_AGENT_CACHE_TTL_MS || 45_000);
 
 export const TEMPORAL_MONTH_TERMS = [
@@ -176,19 +176,20 @@ Regole:
 // Raccoglie in un'unica risposta JSON: classificazione intento, entità, query riscritta, risposta conversazionale.
 export const DEFAULT_AGENT_PROMPT_TEMPLATE = `Sei un assistente per ricerca documentale sul Vaticano e la Chiesa Cattolica.
 Analizza la richiesta utente e restituisci SOLO JSON valido con questo schema:
-{"needsTopic":boolean,"needsTime":boolean,"isNewTopic":boolean,"searchQuery":string,"entities":{"persone":[],"luoghi":[],"enti":[]},"reply":string,"confidence":number}
+{"isConversational":boolean,"needsTopic":boolean,"needsTime":boolean,"isNewTopic":boolean,"searchQuery":string,"entities":{"persone":[],"luoghi":[],"enti":[]},"reply":string,"confidence":number}
 
 Regole:
-- needsTopic=true solo se la domanda e' troppo vaga per cercare (es: "voglio sapere", "dimmi qualcosa", "racconta")
-- needsTime=true solo se strictTemporal=true E non c'e' alcun riferimento temporale (anno, mese, periodo) nella domanda ne' nello storico recente
+- isConversational=true se e' un saluto, ringraziamento, domanda su chi sei, apprezzamento o qualsiasi cosa NON sia una richiesta di ricerca documentale; in questo caso rispondi in modo naturale e cordiale, senza chiedere argomento o periodo
+- needsTopic=true solo se e' chiaramente una richiesta di ricerca ma troppo vaga (es: "voglio sapere", "dimmi qualcosa", "racconta"); se isConversational=true, needsTopic=false
+- needsTime=true solo se strictTemporal=true E non c'e' alcun riferimento temporale nella domanda ne' nello storico; se isConversational=true, needsTime=false
 - isNewTopic=true se la domanda introduce un argomento completamente diverso rispetto alle domande precedenti
-- searchQuery: keyword sintetiche in minuscolo (es: "nomine vescovi gennaio 2000"); normalizza "Giovanni Paolo II" -> "giovanni paolo 2"; rimuovi stopword; se la domanda e' un follow-up temporale, eredita il tema dallo storico
-- entities: nomi propri di persone, luoghi, enti menzionati esplicitamente nella domanda
-- reply: risposta naturale e cordiale in italiano (2-3 frasi)
-  - se needsTopic=true: chiedi gentilmente quale argomento vuole cercare
-  - se needsTime=true: chiedi il periodo temporale (anno o intervallo)
-  - se entrambi mancano: chiedi entrambi con un esempio concreto (es: "ordinazioni vescovi nel 2025")
-  - se pronto: conferma che stai avviando la ricerca
+- searchQuery: keyword sintetiche in minuscolo (es: "nomine vescovi gennaio 2000"); se isConversational=true, lascia stringa vuota
+- entities: nomi propri di persone, luoghi, enti menzionati esplicitamente
+- reply: risposta naturale in italiano (1-3 frasi)
+  - se isConversational=true: rispondi in modo naturale e colloquiale; presentati brevemente se chiedono chi sei
+  - se needsTopic=true: chiedi quale argomento vuole cercare
+  - se needsTime=true: chiedi il periodo temporale
+  - se pronto: conferma che avvii la ricerca
 - confidence: 0-1
 - niente testo extra fuori dal JSON
 

@@ -242,4 +242,10 @@ app.post("/api/rag-stream", async (req, res) => {
 // ─── Avvio ───────────────────────────────────────────────────────────────────
 
 const port = Number(process.env.PORT || 3000);
-app.listen(port, () => console.log(`Server avviato su http://localhost:${port}`));
+app.listen(port, () => {
+  console.log(`Server avviato su http://localhost:${port}`);
+  // Warm-up: carica il modello in memoria subito all'avvio così il primo utente non aspetta
+  askOllama(".", DEFAULT_AGENT_MODEL, 120_000)
+    .then(() => console.log(`Modello "${DEFAULT_AGENT_MODEL}" caricato in memoria.`))
+    .catch((e) => console.warn(`Warm-up modello fallito: ${e.message}`));
+});

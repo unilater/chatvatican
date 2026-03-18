@@ -61,6 +61,39 @@ export async function askOllamaStream(prompt, model, onToken) {
   }
 }
 
+// Messaggi puramente conversazionali gestiti localmente — risposta immediata senza chiamata AI
+const CONVERSAZIONE_LOCALE = [
+  { re: /^(ciao|salve|hey|hello|hi|buongiorno|buonasera|buonanotte)[!.,?\s]*$/i,
+    reply: "Ciao! Sono qui per aiutarti a cercare documenti vaticani. Dimmi di cosa vuoi sapere (argomento + periodo)." },
+  { re: /^(grazie|grazie mille|perfetto|ottimo|benissimo|bravo|esatto|giusto|capito|ok|okay|bene|bene grazie)[!.,?\s]*$/i,
+    reply: "Prego! Hai altre domande o vuoi cercare qualcos'altro?" },
+  { re: /^(chi sei|cosa sei|cosa fai|come funzioni|a cosa servi|presentati)[?!.,\s]*$/i,
+    reply: "Sono un assistente per la ricerca documentale sul Vaticano e la Chiesa Cattolica. Dimmi un argomento e un periodo e cerco tra i documenti disponibili." },
+  { re: /^(come stai|come va|tutto bene)[?!.,\s]*$/i,
+    reply: "Sto bene, grazie! Dimmi pure di cosa hai bisogno." },
+];
+
+function salutoLocale(q) {
+  const match = CONVERSAZIONE_LOCALE.find((c) => c.re.test(q.trim()));
+  return match ? match.reply : null;
+}
+// Keyword del dominio ecclesiastico: se la domanda ne contiene almeno una, è pertinente al RAG
+const DOMINI_KEYWORDS = [
+  "papa", "vescovo", "vescovi", "cardinale", "cardinali", "vaticano", "chiesa", "diocesi",
+  "parrocchia", "sacerdote", "prete", "messa", "sinodo", "concilio", "enciclic",
+  "nomina", "nomine", "ordinazione", "ordinazioni", "pontifice", "pontificato",
+  "apostolico", "santa sede", "curia", "nunzio", "vescovato", "arcivescovo",
+  "religioso", "religiosa", "teologia", "fede", "liturgia", "dogma", "canone",
+  "diocesano", "episcopale", "episcopato", "monsignore", "prelato", "abate",
+  "congregazione", "dicastero", "segreteria", "stato vaticano", "pio", "giovanni paolo",
+  "benedetto", "francesco", "leone", "clemente", "gregorio", "innocenzo",
+];
+
+function isInDomain(q) {
+  const lower = q.toLowerCase();
+  return DOMINI_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
 // Estrae il primo oggetto JSON valido da una stringa di testo
 function parseJson(text) {
   const s = String(text || "").trim();
@@ -151,6 +184,20 @@ export async function buildIntakeDecision({
     .replaceAll("{{previousSources}}", sourcesText)
     .replaceAll("{{question}}", q);
 
+  // Risposta immediata ai saluti senza chiamare l'AI
+  const saluto = salutoLocale(q);
+  if (saluto) {
+    return {
+      readyToSearch: false,
+      answer: saluto,
+      proposedSearchQuery: "",
+      missingFields: ["topic"],
+      stage: "need-topic",
+      searchPlan: null,
+      entities: { persone: [], luoghi: [], enti: [] },
+    };
+  }
+
   // Chiama l'AI con timeout dedicato all'agente
   let ai = null;
   try {
@@ -161,8 +208,14 @@ export async function buildIntakeDecision({
   }
 
   // Determina cosa manca per poter cercare
-  const needsTopic = ai ? Boolean(ai.needsTopic) : true;
-  const needsTime = strictTemporal && ai ? Boolean(ai.needsTime) : false;
+  const isConversational = ai ? Boolean(ai.isConversational) : false;
+  const isOffTopic = ai ? Boolean(ai.isOffTopic) : false;
+  const notSearchable = isConversational || isOffTopic;
+
+  // Fallback senza AI: pertinente solo se contiene keyword del dominio ecclesiastico
+  const inDomain = isInDomain(q);
+  const needsTopic = !notSearchable && (ai ? Boolean(ai.needsTopic) : !inDomain);
+  const needsTime = !notSearchable && strictTemporal && (ai ? Boolean(ai.needsTime) : false);
   const missingFields = [];
   if (needsTopic) missingFields.push("topic");
   if (needsTime) missingFields.push("time");
