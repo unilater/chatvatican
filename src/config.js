@@ -17,15 +17,10 @@ export const DEFAULT_SEARCH_INDEX = process.env.DEFAULT_SEARCH_INDEX || "testi_e
 export const SEARCH_API_KEY = process.env.SEARCH_API_KEY || "";
 export const SEARCH_API_KEY_BOLLETTINO = process.env.SEARCH_API_KEY_BOLLETTINO || "";
 
-export const DEFAULT_SEARCH_QUERY = process.env.DEFAULT_SEARCH_QUERY || "papa leone";
 export const DEFAULT_LIMIT = Number(process.env.DEFAULT_LIMIT || 5);
 export const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "gemma:7b";
 export const DEFAULT_AGENT_MODEL =
   process.env.DEFAULT_AGENT_MODEL || process.env.AGENT_MODEL || DEFAULT_MODEL;
-export const MAX_TEXT_EXCERPT_CHARS = Number(process.env.MAX_TEXT_EXCERPT_CHARS || 1800);
-export const MAX_CONTEXT_DOCS = Number(process.env.MAX_CONTEXT_DOCS || 3);
-export const SEARCH_CANDIDATE_MULTIPLIER = Number(process.env.SEARCH_CANDIDATE_MULTIPLIER || 3);
-export const SEARCH_CACHE_TTL_MS = 30_000;
 export const UI_STATE_SCOPE_DEFAULT = "default";
 
 export const SEARCH_PROFILES = {
@@ -40,76 +35,6 @@ export const SEARCH_PROFILES = {
     defaultChatMode: "agent",
   },
 };
-
-export const AI_ENTITY_FALLBACK_ENABLED = process.env.AI_ENTITY_FALLBACK_ENABLED !== "false";
-export const AI_ENTITY_MIN_LOCAL_TERMS = Number(process.env.AI_ENTITY_MIN_LOCAL_TERMS || 3);
-export const AI_ENTITY_TIMEOUT_MS = Number(process.env.AI_ENTITY_TIMEOUT_MS || 1800);
-export const AI_ENTITY_MODEL = process.env.AI_ENTITY_MODEL || DEFAULT_AGENT_MODEL;
-export const AI_ENTITY_CACHE_TTL_MS = 60_000;
-
-// Timeout per la singola call unificata dell'agente (sostituisce 5 call separate)
-export const AI_AGENT_TIMEOUT_MS = Number(process.env.AI_AGENT_TIMEOUT_MS || 20_000);
-export const AI_AGENT_CACHE_TTL_MS = Number(process.env.AI_AGENT_CACHE_TTL_MS || 45_000);
-
-export const TEMPORAL_MONTH_TERMS = [
-  "gennaio",
-  "febbraio",
-  "marzo",
-  "aprile",
-  "maggio",
-  "giugno",
-  "luglio",
-  "agosto",
-  "settembre",
-  "ottobre",
-  "novembre",
-  "dicembre",
-];
-
-export const MONTH_TO_NUMBER = {
-  gennaio: 1,
-  febbraio: 2,
-  marzo: 3,
-  aprile: 4,
-  maggio: 5,
-  giugno: 6,
-  luglio: 7,
-  agosto: 8,
-  settembre: 9,
-  ottobre: 10,
-  novembre: 11,
-  dicembre: 12,
-};
-
-export const TEMPORAL_REFERENCE_TERMS = [
-  "oggi",
-  "ieri",
-  "domani",
-  "settimana",
-  "settimane",
-  "mese",
-  "mesi",
-  "anno",
-  "anni",
-  "trimestre",
-  "semestre",
-  "ultimo",
-  "ultimi",
-  "ultima",
-  "ultime",
-  "scorso",
-  "scorsi",
-  "scorsa",
-  "scorse",
-  "precedente",
-  "precedenti",
-  "recente",
-  "recenti",
-  "recentemente",
-  "attuale",
-  "attuali",
-  "pontificato",
-];
 
 export const UI_STATE_FILE = path.join(__dirname, "..", "storage", "ui-state.json");
 

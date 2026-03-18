@@ -1,21 +1,18 @@
 // server.js — Server Express: routing API per il RAG ecclesiale
 
 import express from "express";
-import { buildIntakeDecision, askOllama, askOllamaStream } from "./src/ai.js";
-import {
-  fetchContextCached,
-  normalizeSearchIndex,
-  getSearchProfile,
-  buildPrompt,
-  appendSourceLinks,
-} from "./src/search.js";
+import { askOllama, askOllamaStream } from "./src/ai.js";
+import { searchDocuments, DEFAULT_FACETS } from "./src/meili.js";
 import { readUiState, writeUiState, normalizeUiScope } from "./src/state.js";
-import {
-  DEFAULT_LIMIT,
-  DEFAULT_MODEL,
-  DEFAULT_AGENT_MODEL,
-  DEFAULT_SEARCH_QUERY,
-} from "./src/config.js";
+import { DEFAULT_AGENT_MODEL, OLLAMA_BASE_URL, DEFAULT_SEARCH_INDEX } from "./src/config.js";
+
+// Valida e normalizza il nome dell'indice Meilisearch
+function normalizeSearchIndex(name) {
+  const n = String(name || "").trim().toLowerCase();
+  if (!n) return DEFAULT_SEARCH_INDEX;
+  if (!/^[a-z0-9_-]+$/.test(n)) throw new Error("Nome indice non valido");
+  return n;
+}
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -46,194 +43,139 @@ app.post("/api/ui-state", async (req, res) => {
   }
 });
 
-// ─── Agente: analizza la domanda, decide query e filtri ──────────────────────
 
-app.post("/api/intake-chat", async (req, res) => {
+// ─── Motore di ricerca avanzato ─────────────────────────────────────────────
+
+app.post("/api/search/query", async (req, res) => {
   try {
-    const question = String(req.body?.question || "").trim();
-    if (!question) return res.status(400).json({ error: "La domanda è obbligatoria." });
+    const query  = String(req.body?.query  ?? "").trim();
+    const index  = normalizeSearchIndex(req.body?.index);
+    const limit  = Math.min(Math.max(Number(req.body?.limit  ?? 20), 1), 100);
+    const offset = Math.max(Number(req.body?.offset ?? 0), 0);
+    const filter = String(req.body?.filter ?? "");
+    const sort   = Array.isArray(req.body?.sort)   ? req.body.sort   : [];
+    const facets = Array.isArray(req.body?.facets) ? req.body.facets : DEFAULT_FACETS;
 
-    const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
-    const profile = getSearchProfile(searchIndex);
-    const state = await readUiState(profile.key);
-    const agentModel =
-      String(req.body?.agentModel || state.agentModel || "").trim() || DEFAULT_AGENT_MODEL;
-
-    const result = await buildIntakeDecision({
-      question,
-      history: Array.isArray(req.body?.history) ? req.body.history : [],
-      previousSources: Array.isArray(req.body?.previousSources)
-        ? req.body.previousSources
-        : [],
-      profile,
-      agentPromptTemplate: state.agentPromptTemplate,
-      agentModel,
-    });
-
+    const result = await searchDocuments({ query, index, limit, offset, filter, sort, facets });
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ─── Anteprima ricerca (uso debug/admin) ─────────────────────────────────────
+// ─── Lista modelli Ollama disponibili ───────────────────────────────────────
 
-app.post("/api/search-preview", async (req, res) => {
+app.get("/api/discover/models", async (req, res) => {
   try {
-    const searchQuery = String(req.body?.searchQuery || "").trim();
-    if (!searchQuery) return res.json({ hits: [], context: "", metadata: {} });
-
-    const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
-    const limit = Number(req.body?.limit || DEFAULT_LIMIT);
-    const searchPlan = req.body?.searchPlan || null;
-
-    const result = await fetchContextCached(searchQuery, limit, searchIndex, { searchPlan });
-
-    res.json({
-      hits: result.hits,
-      context: result.context,
-      metadata: {
-        searchQuery: result.searchQuery,
-        limit,
-        searchIndex,
-        cached: result.cached,
-        candidateCount: result.candidateCount,
-        retrievalQuery: result.searchQuery,
-        activeFilter: result.filter || "",
-        searchPlan,
-        queryTerms: [],
-        detectedEntities: searchPlan?.filters || { persone: [], luoghi: [], enti: [] },
-        entityKeywordTerms: [],
-      },
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    const r = await fetch(`${OLLAMA_BASE_URL}/api/tags`);
+    if (!r.ok) return res.json({ models: [] });
+    const data = await r.json();
+    const models = (data?.models ?? []).map((m) => ({
+      name: m.name,
+      size: m.size,
+      modified_at: m.modified_at,
+    }));
+    res.json({ models });
+  } catch {
+    res.json({ models: [] });
   }
 });
 
-// ─── RAG non streaming ───────────────────────────────────────────────────────
+// ─── Search+Stream unificato (Meilisearch + Ollama) ──────────────────────────
+// Protocollo NDJSON:
+//   {"type":"hits", hits:[...], estimatedTotalHits:N, processingTimeMs:N}
+//   {"type":"token", text:"..."}          ← streaming Ollama
+//   {"type":"done", answer:"..."}
+//   {"type":"error", error:"..."}
 
-app.post("/api/rag", async (req, res) => {
-  try {
-    const question = String(req.body?.question || "").trim();
-    if (!question) return res.status(400).json({ error: "La domanda è obbligatoria." });
-
-    const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
-    const profile = getSearchProfile(searchIndex);
-    const state = await readUiState(profile.key);
-    const model = String(req.body?.model || state.ragModel || "").trim() || DEFAULT_MODEL;
-    const limit = Number(req.body?.limit || DEFAULT_LIMIT);
-    const searchQuery =
-      String(req.body?.searchQuery || question).trim() || DEFAULT_SEARCH_QUERY;
-    const searchPlan = req.body?.searchPlan || null;
-    const promptTemplate = String(req.body?.promptTemplate || state.promptTemplate || "");
-
-    // Salva le preferenze UI aggiornate
-    await writeUiState({ ...state, limit, ragModel: model }, profile.key);
-
-    const { hits, context, searchQuery: usedQuery, filter, cached } =
-      await fetchContextCached(searchQuery, limit, searchIndex, { searchPlan });
-
-    if (!context) {
-      return res.json({
-        answer: "Nessun documento trovato per la query indicata.",
-        hits,
-        context,
-        metadata: { model, searchQuery: usedQuery, limit, searchIndex, cached },
-      });
-    }
-
-    const prompt = buildPrompt(question, context, promptTemplate);
-    const rawAnswer = await askOllama(prompt, model);
-    const answer = appendSourceLinks(rawAnswer, hits);
-
-    res.json({
-      answer,
-      hits,
-      context,
-      metadata: {
-        model,
-        searchQuery: usedQuery,
-        limit,
-        searchIndex,
-        cached,
-        activeFilter: filter || "",
-        searchPlan,
-      },
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ─── RAG streaming ───────────────────────────────────────────────────────────
-
-app.post("/api/rag-stream", async (req, res) => {
+app.post("/api/search-stream", async (req, res) => {
   res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
 
+  const emit = (obj) => res.write(JSON.stringify(obj) + "\n");
+
   try {
-    const question = String(req.body?.question || "").trim();
-    if (!question) {
-      sendEvent(res, { type: "error", error: "La domanda è obbligatoria." });
+    const query  = String(req.body?.query  ?? "").trim();
+    const index  = normalizeSearchIndex(req.body?.index);
+    const limit  = Math.min(Math.max(Number(req.body?.limit  ?? 20), 1), 100);
+    const offset = Math.max(Number(req.body?.offset ?? 0), 0);
+    const filter = String(req.body?.filter ?? "");
+    const sort   = Array.isArray(req.body?.sort)   ? req.body.sort   : [];
+    const facets = Array.isArray(req.body?.facets) ? req.body.facets : DEFAULT_FACETS;
+    const model  = String(req.body?.model  ?? DEFAULT_AGENT_MODEL).trim() || DEFAULT_AGENT_MODEL;
+    const generateAnswer = req.body?.generateAnswer !== false;
+    // Prompt personalizzato dall'admin (opzionale). Variabili: {{query}}, {{context}}
+    const customSystemPrompt = String(req.body?.systemPrompt ?? "").trim();
+
+    if (!query) {
+      emit({ type: "error", error: "Query obbligatoria." });
       return res.end();
     }
 
-    const searchIndex = normalizeSearchIndex(req.body?.searchIndex);
-    const profile = getSearchProfile(searchIndex);
-    const state = await readUiState(profile.key);
-    const model = String(req.body?.model || state.ragModel || "").trim() || DEFAULT_MODEL;
-    const limit = Number(req.body?.limit || DEFAULT_LIMIT);
-    const searchQuery =
-      String(req.body?.searchQuery || question).trim() || DEFAULT_SEARCH_QUERY;
-    const searchPlan = req.body?.searchPlan || null;
-    const promptTemplate = String(req.body?.promptTemplate || state.promptTemplate || "");
-
-    // Salva le preferenze UI aggiornate
-    await writeUiState({ ...state, limit, ragModel: model }, profile.key);
-
-    const { hits, context, searchQuery: usedQuery, filter, cached } =
-      await fetchContextCached(searchQuery, limit, searchIndex, { searchPlan });
-
-    // Invia subito i risultati di ricerca (la UI aggiorna il debug panel)
-    sendEvent(res, {
-      type: "meta",
-      hits,
-      context,
-      metadata: {
-        model,
-        searchQuery: usedQuery,
-        limit,
-        searchIndex,
-        cached,
-        candidateCount: hits.length,
-        retrievalQuery: usedQuery,
-        activeFilter: filter || "",
-        searchPlan,
-        queryTerms: [],
-        detectedEntities: searchPlan?.filters || { persone: [], luoghi: [], enti: [] },
-        entityKeywordTerms: [],
-      },
+    // 1. Meilisearch — emette subito i risultati
+    const meiliResult = await searchDocuments({ query, index, limit, offset, filter, sort, facets });
+    emit({
+      type: "hits",
+      hits: meiliResult.hits ?? [],
+      estimatedTotalHits: meiliResult.estimatedTotalHits ?? meiliResult.totalHits ?? 0,
+      processingTimeMs: meiliResult.processingTimeMs ?? 0,
+      facetDistribution: meiliResult.facetDistribution ?? {},
     });
 
-    if (!context) {
-      sendEvent(res, { type: "done", answer: "Nessun documento trovato." });
+    if (!generateAnswer) {
+      emit({ type: "done", answer: "" });
       return res.end();
     }
 
-    const prompt = buildPrompt(question, context, promptTemplate);
+    // 2. Costruisce contesto per Ollama dalle hits
+    const hits = meiliResult.hits ?? [];
     let fullAnswer = "";
 
-    await askOllamaStream(prompt, model, (token) => {
-      fullAnswer += token;
-      sendEvent(res, { type: "token", text: token });
-    });
+    if (hits.length === 0) {
+      // Nessun risultato: risposta conversazionale
+      const convPrompt =
+        `Sei un esperto di documenti cristiani e vaticani.\n` +
+        `Non hai trovato documenti pertinenti per: "${query}".\n` +
+        `Rispondi brevemente e in modo cordiale in italiano.`;
+      await askOllamaStream(convPrompt, model, (tok) => {
+        fullAnswer += tok;
+        emit({ type: "token", text: tok });
+      });
+    } else {
+      // RAG con citazioni numerate [1][2]...
+      const MAX_HITS_FOR_CONTEXT = Math.min(hits.length, 5);
+      const contextBlocks = hits.slice(0, MAX_HITS_FOR_CONTEXT).map((h, i) => {
+        const testo = String(h.testo_originale ?? "").slice(0, 800);
+        const abstr = String(h.abstract ?? "");
+        return `[${i + 1}] Titolo: ${h.titolo ?? ""}\nFonte: ${h.fonte ?? ""}\n${abstr ? `Abstract: ${abstr}\n` : ""}${testo ? `Testo: ${testo}` : ""}`;
+      }).join("\n\n---\n\n");
 
-    const answer = appendSourceLinks(fullAnswer, hits);
-    sendEvent(res, { type: "done", answer });
+      let ragPrompt;
+      if (customSystemPrompt) {
+        // Usa il template personalizzato con sostituzione variabili
+        ragPrompt = customSystemPrompt
+          .replace(/\{\{query\}\}/g, query)
+          .replace(/\{\{context\}\}/g, contextBlocks);
+      } else {
+        ragPrompt =
+          `Sei un esperto di documenti cristiani e vaticani.\n` +
+          `Rispondi in italiano alla domanda usando SOLO le fonti sotto.\n` +
+          `Cita le fonti con [1], [2] ecc. nel testo della risposta.\n` +
+          `Sii preciso, sintetico e chiaro.\n\n` +
+          `DOMANDA: ${query}\n\n` +
+          `FONTI:\n${contextBlocks}`;
+      }
+
+      await askOllamaStream(ragPrompt, model, (tok) => {
+        fullAnswer += tok;
+        emit({ type: "token", text: tok });
+      });
+    }
+
+    emit({ type: "done", answer: fullAnswer });
   } catch (e) {
-    sendEvent(res, { type: "error", error: e.message });
+    emit({ type: "error", error: e.message });
   }
 
   res.end();

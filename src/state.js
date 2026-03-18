@@ -14,7 +14,7 @@ import {
 
 export function normalizeUiScope(scope) {
   const candidate = String(scope || "").trim().toLowerCase();
-  if (candidate === "notizie" || candidate === "bollettini") {
+  if (candidate === "notizie" || candidate === "bollettini" || candidate === "search") {
     return candidate;
   }
   return UI_STATE_SCOPE_DEFAULT;
@@ -28,7 +28,7 @@ export function getDefaultUiState(scope = UI_STATE_SCOPE_DEFAULT) {
     limit: DEFAULT_LIMIT,
     ragModel: DEFAULT_MODEL,
     agentModel: DEFAULT_AGENT_MODEL,
-    chatMode: profile.defaultChatMode,
+    chatMode: scope === "search" ? "rag" : profile.defaultChatMode,
     promptTemplate:
       scope === "bollettini" ? BOLLETTINO_PROMPT_TEMPLATE : DEFAULT_PROMPT_TEMPLATE,
     agentPromptTemplate: DEFAULT_AGENT_PROMPT_TEMPLATE,
