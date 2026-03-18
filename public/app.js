@@ -188,21 +188,19 @@ function normalizeReasoningBlocks(text) {
 }
 
 function buildAgentDebugPayload(intakeResponse) {
-  const researchJson = intakeResponse?.researchJson || {};
-  const searchPlan = intakeResponse?.searchPlan || researchJson?.searchPlan || null;
-  const entities = researchJson?.entities || { persone: [], luoghi: [], enti: [] };
-  const terms = researchJson?.terms || [];
+  const searchPlan = intakeResponse?.searchPlan || null;
+  const entities = intakeResponse?.entities || { persone: [], luoghi: [], enti: [] };
 
   return {
     metadata: {
       debugMode: "agent",
-      stage: intakeResponse?.stage || researchJson?.stage || "agent",
+      stage: intakeResponse?.stage || "agent",
       cached: false,
       candidateCount: "-",
-      retrievalQuery: searchPlan?.textQuery || researchJson?.searchQuery || "",
+      retrievalQuery: searchPlan?.textQuery || "",
       activeFilter: searchPlan?.filterExpression || "",
       searchPlan,
-      queryTerms: terms,
+      queryTerms: [],
       detectedEntities: entities,
       entityKeywordTerms: [],
       usedAiEntityFallback: false,
@@ -696,7 +694,7 @@ chatForm.addEventListener("submit", async (event) => {
         pendingAutoSearchRequest = {
           question,
           searchQuery: String(intakeResponse.proposedSearchQuery),
-          searchPlan: intakeResponse?.searchPlan || intakeResponse?.researchJson?.searchPlan || null,
+          searchPlan: intakeResponse?.searchPlan || null,
         };
         setSearchStatus("Modalita' ricerca attivata: intent completo, avvio automatico...");
         scheduleSearchPrefetch();
