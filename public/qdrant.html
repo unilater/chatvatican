@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Archivio Cristiano</title>
+  <title>Ricerca Ecclesiale</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
@@ -16,12 +16,7 @@
 
   <!-- ── HEADER ── -->
   <header id="topbar">
-    <a href="#" class="logo">Archivio Cristiano</a>
-
-    <span class="qdrant-badge" title="Ricerca semantica vettoriale">
-      <svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor" aria-hidden="true"><circle cx="4" cy="4" r="4"/></svg>
-      Qdrant
-    </span>
+    <a href="#" class="logo">Ricerca Ecclesiale</a>
 
     <div class="topbar-controls">
       <!-- Role switch -->
@@ -32,11 +27,24 @@
     </div>
   </header>
 
+  <!-- ── CONTENT ROW ── -->
+  <div id="content-row">
+
+  <!-- ── SIDEBAR ── -->
+  <aside id="sidebar" class="hidden">
+    <div class="sidebar-header">Fonti trovate</div>
+    <div id="sidebar-filters"></div>
+    <div id="sidebar-sources"></div>
+  </aside>
+
+  <!-- ── MAIN COLUMN ── -->
+  <div id="main-col">
+
   <!-- ── CHAT AREA ── -->
   <main id="chat-area">
     <!-- Welcome -->
     <div id="welcome">
-      <h1>Archivio Cristiano</h1>
+      <h1>Ricerca Ecclesiale</h1>
       <p>Ricerca semantica nei documenti vaticani ed ecclesiali</p>
     </div>
 
@@ -84,7 +92,10 @@
         placeholder="Lascia vuoto per nessun prompt.&#10;Esempio: Sei un esperto di documenti vaticani.&#10;&#10;DOMANDA: {{question}}&#10;&#10;FONTI:&#10;{{context}}"></textarea>
 
     </div>
-  </div>
+  </div><!-- /#admin-panel -->
+
+  </div><!-- /#main-col -->
+  </div><!-- /#content-row -->
 
   <!-- ── INPUT FOOTER ── -->
   <footer id="input-area">
@@ -102,7 +113,7 @@
           </svg>
         </button>
       </div>
-      <p class="input-hint">Ricerca semantica vettoriale · Qdrant + Ollama RAG</p>
+      <p class="input-hint">Ricerca semantica nei documenti ecclesiali e vaticani</p>
     </div>
   </footer>
 

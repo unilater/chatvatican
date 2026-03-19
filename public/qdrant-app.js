@@ -11,6 +11,8 @@ let isStreaming  = false;
 let abortCtrl   = null;
 let msgCounter  = 0;
 let sourceLimit = 10;
+let lastQuery   = "";
+let lastHits    = [];
 
 // ─── Utilità ─────────────────────────────────────────────────────────────────
 
@@ -185,7 +187,7 @@ function appendAssistantMsg() {
     <div class="msg-avatar" aria-hidden="true">AC</div>
     <div class="msg-body">
       <div class="msg-answer" id="answer-${id}">
-        <div class="typing-dots"><span></span><span></span><span></span></div>
+        <div class="typing-dots" id="typing-${id}"><span></span><span></span><span></span><span class="typing-timer" id="timer-${id}">0s</span></div>
       </div>
       <div class="msg-sources hidden" id="sources-${id}">
         <button class="sources-toggle" type="button" aria-expanded="true"></button>
@@ -205,7 +207,7 @@ function updateAnswer(id, rawText) {
   scrollToBottom();
 }
 
-function finalizeAnswer(id, rawText, hits) {
+function finalizeAnswer(id, rawText, hits, isDeepDive = false) {
   const { thinks, text: answerText } = parseStream(rawText);
 
   const el = $(`answer-${id}`);
@@ -221,7 +223,12 @@ function finalizeAnswer(id, rawText, hits) {
 
   const sourcesEl = $(`sources-${id}`);
   if (sourcesEl && hits?.length) {
-    // Mostra sempre le top-sourceLimit fonti; in modalità admin anche i punteggi
+    if (!isDeepDive) {
+      lastHits = hits;
+      populateSidebar(hits);
+    }
+
+  // Mostra sempre le top-sourceLimit fonti; in modalità admin anche i punteggi
     const displayHits = hits.slice(0, sourceLimit);
 
     if (displayHits.length) {
@@ -251,7 +258,7 @@ function highlightSource(msgId, n) {
 
 // ─── Invio query ──────────────────────────────────────────────────────────────
 
-async function sendQuery(query) {
+async function sendQuery(query, preloadedHits = null) {
   if (isStreaming || !query.trim()) return;
 
   const collection = $("collection-select")?.value || "";
@@ -260,11 +267,20 @@ async function sendQuery(query) {
     return;
   }
 
+  if (!preloadedHits) lastQuery = query;
+
   appendUserMsg(query);
   const assistantId = appendAssistantMsg();
 
   isStreaming = true;
   updateSendBtn();
+
+  // Avvia timer secondi nel cursore
+  const timerEl = $(`timer-${assistantId}`);
+  const t0 = Date.now();
+  const timerInterval = setInterval(() => {
+    if (timerEl) timerEl.textContent = Math.floor((Date.now() - t0) / 1000) + "s";
+  }, 1000);
 
   const model        = $("model-select")?.value || "";
   const customPrompt = $("system-prompt")?.value?.trim() || "";
@@ -283,6 +299,7 @@ async function sendQuery(query) {
         model,
         generateAnswer: true,
         systemPrompt: customPrompt,
+        ...(preloadedHits ? { hits: preloadedHits } : {}),
       }),
     });
 
@@ -308,13 +325,14 @@ async function sendQuery(query) {
 
         if (evt.type === "hits") hits = evt.hits ?? [];
         if (evt.type === "token") { fullAnswer += evt.text; updateAnswer(assistantId, fullAnswer); }
-        if (evt.type === "done")  { finalizeAnswer(assistantId, fullAnswer, hits); }
+        if (evt.type === "done")  { finalizeAnswer(assistantId, fullAnswer, hits, !!preloadedHits); }
         if (evt.type === "error") { showError(assistantId, evt.error); }
       }
     }
   } catch (e) {
     if (e.name !== "AbortError") showError(assistantId, e.message);
   } finally {
+    clearInterval(timerInterval);
     isStreaming = false;
     abortCtrl   = null;
     updateSendBtn();
@@ -435,6 +453,108 @@ async function saveState() {
 function autoResize(el) {
   el.style.height = "auto";
   el.style.height = Math.min(el.scrollHeight, 200) + "px";
+}
+
+// ─── Sidebar ──────────────────────────────────────────────────────────────────
+
+const sidebarActiveFilters = { persone: null, enti: null, luoghi: null };
+
+function populateSidebar(hits) {
+  const sidebar = $("sidebar");
+  const filtersEl = $("sidebar-filters");
+  if (!sidebar || !filtersEl || !hits?.length) return;
+
+  // Reset filtri
+  sidebarActiveFilters.persone = null;
+  sidebarActiveFilters.enti    = null;
+  sidebarActiveFilters.luoghi  = null;
+  filtersEl.innerHTML = "";
+
+  // Costruisce le mappe entity → conteggio
+  const maps = { persone: new Map(), enti: new Map(), luoghi: new Map() };
+  hits.forEach(h => {
+    const pl = h.payload ?? {};
+    ["persone", "enti", "luoghi"].forEach(k => {
+      const arr = Array.isArray(pl[k]) ? pl[k] : (pl[k] ? [pl[k]] : []);
+      arr.forEach(v => v && maps[k].set(v, (maps[k].get(v) || 0) + 1));
+    });
+  });
+
+  const labels = { persone: "Persone", enti: "Enti", luoghi: "Luoghi" };
+  Object.keys(maps).forEach(key => {
+    if (!maps[key].size) return;
+    const top = [...maps[key].entries()].sort((a, b) => b[1] - a[1]).slice(0, 12);
+    const group = document.createElement("div");
+    group.className = "filter-group";
+    group.innerHTML = `<div class="filter-group-label">${labels[key]}</div><div class="filter-chips" id="chips-${key}"></div>`;
+    const chipsEl = group.querySelector(".filter-chips");
+    top.forEach(([name]) => {
+      const chip = document.createElement("button");
+      chip.className = "filter-chip";
+      chip.type = "button";
+      chip.textContent = name;
+      chip.addEventListener("click", () => {
+        const wasActive = chip.classList.contains("active");
+        chipsEl.querySelectorAll(".filter-chip").forEach(c => c.classList.remove("active"));
+        sidebarActiveFilters[key] = wasActive ? null : name;
+        if (!wasActive) chip.classList.add("active");
+        renderSidebarSources(hits);
+      });
+      chipsEl.appendChild(chip);
+    });
+    filtersEl.appendChild(group);
+  });
+
+  renderSidebarSources(hits);
+  sidebar.classList.remove("hidden");
+}
+
+function renderSidebarSources(hits) {
+  const sourcesEl = $("sidebar-sources");
+  if (!sourcesEl) return;
+
+  // Filtra lato client in base ai chip attivi
+  const filtered = hits.filter(h => {
+    const pl = h.payload ?? {};
+    return ["persone", "enti", "luoghi"].every(k => {
+      if (!sidebarActiveFilters[k]) return true;
+      const arr = Array.isArray(pl[k]) ? pl[k] : (pl[k] ? [pl[k]] : []);
+      return arr.includes(sidebarActiveFilters[k]);
+    });
+  });
+
+  sourcesEl.innerHTML = "";
+  filtered.forEach((hit, i) => {
+    const pl  = hit.payload ?? {};
+    const { titolo, fonte, data, link } = getPayloadFields(pl);
+    const safeLink = /^https?:\/\//i.test(link) ? link : "";
+
+    const card = document.createElement("div");
+    card.className = "sidebar-source-card";
+
+    const metaParts = [fonte, formatDate(data)].filter(Boolean).map(escHtml).join(" · ");
+    card.innerHTML = `
+      <div class="sidebar-source-rank">#${i + 1}</div>
+      <div class="sidebar-source-title">${escHtml(titolo || "(senza titolo)")}</div>
+      ${metaParts ? `<div class="sidebar-source-meta">${metaParts}</div>` : ""}
+      ${safeLink ? `<div class="sidebar-source-meta"><a href="${escHtml(safeLink)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">Apri documento →</a></div>` : ""}
+      <button class="sidebar-source-ask" type="button">Chiedi a AI</button>`;
+
+    card.querySelector(".sidebar-source-ask").addEventListener("click", () => {
+      deepDiveDoc(hit, i + 1, titolo);
+    });
+
+    sourcesEl.appendChild(card);
+  });
+
+  if (!filtered.length) {
+    sourcesEl.innerHTML = `<div style="font-size:12px;color:var(--text-3);padding:12px 4px">Nessuna fonte corrisponde ai filtri.</div>`;
+  }
+}
+
+function deepDiveDoc(hit, rank, titolo) {
+  const label = titolo ? `Approfondisci: "${titolo.slice(0, 60)}${titolo.length > 60 ? "…" : ""}"` : `Approfondisci documento #${rank}`;
+  sendQuery(lastQuery || label, [hit]);
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
