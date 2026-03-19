@@ -1,71 +1,32 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { UI_STATE_FILE, DEFAULT_MODEL, DEFAULT_PROMPT_TEMPLATE } from "./config.js";
+import { APP_STATE_FILE, DEFAULT_AGENT_MODEL } from "./config.js";
 
-const SCOPE = "search";
-
-export function normalizeUiScope(_scope) {
-  return SCOPE;
+export function getDefaultState() {
+  return { uiMode: "user", ragModel: DEFAULT_AGENT_MODEL, promptTemplate: "" };
 }
 
-export function getDefaultUiState() {
+function sanitize(raw) {
+  const d = getDefaultState();
   return {
-    uiMode: "user",
-    ragModel: DEFAULT_MODEL,
-    promptTemplate: DEFAULT_PROMPT_TEMPLATE,
+    uiMode:         String(raw?.uiMode || "").toLowerCase() === "admin" ? "admin" : "user",
+    ragModel:       String(raw?.ragModel       || d.ragModel).trim() || d.ragModel,
+    promptTemplate: String(raw?.promptTemplate ?? ""),
   };
 }
 
-export function sanitizeUiState(rawState) {
-  const defaults = getDefaultUiState();
-  const parsedUiMode = String(rawState?.uiMode || defaults.uiMode).trim().toLowerCase();
-  return {
-    uiMode: parsedUiMode === "admin" ? "admin" : "user",
-    ragModel:
-      String(rawState?.ragModel || defaults.ragModel).trim() || defaults.ragModel,
-    promptTemplate:
-      String(rawState?.promptTemplate || defaults.promptTemplate) || defaults.promptTemplate,
-  };
-}
-
-function normalizeUiStateStore(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return { scopes: {} };
-  }
-  if (raw.scopes && typeof raw.scopes === "object" && !Array.isArray(raw.scopes)) {
-    return { scopes: raw.scopes };
-  }
-  return { scopes: { [SCOPE]: raw } };
-}
-
-async function ensureStorageDir() {
-  await fs.mkdir(path.dirname(UI_STATE_FILE), { recursive: true });
-}
-
-export async function readUiState(_scope) {
+export async function readState() {
   try {
-    const fileContent = await fs.readFile(UI_STATE_FILE, "utf8");
-    const store = normalizeUiStateStore(JSON.parse(fileContent));
-    return sanitizeUiState(store.scopes[SCOPE]);
-  } catch (error) {
-    if (error?.code === "ENOENT") return getDefaultUiState();
-    throw error;
+    return sanitize(JSON.parse(await fs.readFile(APP_STATE_FILE, "utf8")));
+  } catch (e) {
+    if (e.code === "ENOENT") return getDefaultState();
+    throw e;
   }
 }
 
-export async function writeUiState(nextState, _scope) {
-  await ensureStorageDir();
-  let currentStore = { scopes: {} };
-  try {
-    const fileContent = await fs.readFile(UI_STATE_FILE, "utf8");
-    currentStore = normalizeUiStateStore(JSON.parse(fileContent));
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  const state = sanitizeUiState(nextState);
-  const nextStore = {
-    scopes: { ...currentStore.scopes, [SCOPE]: state },
-  };
-  await fs.writeFile(UI_STATE_FILE, `${JSON.stringify(nextStore, null, 2)}\n`, "utf8");
+export async function writeState(next) {
+  const state = sanitize({ ...await readState(), ...next });
+  await fs.mkdir(path.dirname(APP_STATE_FILE), { recursive: true });
+  await fs.writeFile(APP_STATE_FILE, JSON.stringify(state, null, 2) + "\n", "utf8");
   return state;
 }

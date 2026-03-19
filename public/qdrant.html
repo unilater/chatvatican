@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Archivio Cristiano</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="search-styles.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ── HEADER ── -->
+  <header id="topbar">
+    <a href="#" class="logo">Archivio Cristiano</a>
+
+    <span class="qdrant-badge" title="Ricerca semantica vettoriale">
+      <svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor" aria-hidden="true"><circle cx="4" cy="4" r="4"/></svg>
+      Qdrant
+    </span>
+
+    <div class="topbar-sep"></div>
+
+    <!-- Collection -->
+    <select id="collection-select" class="select-pill" title="Collection Qdrant" aria-label="Collection"></select>
+
+    <div class="topbar-controls">
+      <!-- Model selector — admin only -->
+      <div id="model-wrap" class="hidden" title="Modello AI">
+        <select id="model-select" class="select-pill" aria-label="Modello AI"></select>
+      </div>
+
+      <!-- Role switch -->
+      <div class="role-switch" aria-label="Modalità vista">
+        <button id="userModeBtn"  class="role-switch-btn" type="button" data-role="user"  aria-pressed="true">Utente</button>
+        <button id="adminModeBtn" class="role-switch-btn" type="button" data-role="admin" aria-pressed="false">Admin</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── CHAT AREA ── -->
+  <main id="chat-area">
+    <!-- Welcome -->
+    <div id="welcome">
+      <h1>Archivio Cristiano</h1>
+      <p>Ricerca semantica nei documenti vaticani ed ecclesiali</p>
+    </div>
+
+    <!-- Messages -->
+    <div id="messages"></div>
+  </main>
+
+  <!-- ── ADMIN PANEL (prompt editor) ── -->
+  <div id="admin-panel" class="hidden">
+    <div class="admin-panel-inner">
+      <div class="admin-panel-header">
+        <span class="admin-panel-title">Prompt RAG</span>
+        <span class="admin-panel-hint">Variabili: <code>{{query}}</code> e <code>{{context}}</code> — lascia vuoto per il default</span>
+        <div class="admin-panel-actions">
+          <span id="save-status" class="save-status"></span>
+          <button id="reset-prompt-btn" class="btn-admin" type="button">Reset</button>
+          <button id="save-prompt-btn"  class="btn-admin primary" type="button">Salva</button>
+        </div>
+      </div>
+      <textarea id="system-prompt" class="prompt-editor" rows="4"
+        placeholder="Lascia vuoto per il prompt predefinito.&#10;Esempio: Sei un esperto di documenti vaticani. Rispondi in italiano.&#10;&#10;DOMANDA: {{query}}&#10;&#10;FONTI:&#10;{{context}}"></textarea>
+    </div>
+  </div>
+
+  <!-- ── INPUT FOOTER ── -->
+  <footer id="input-area">
+    <div class="input-wrap">
+      <div class="input-box">
+        <textarea
+          id="query-input"
+          placeholder="Poni una domanda sui documenti ecclesiali…"
+          rows="1"
+          aria-label="Testo della ricerca"
+        ></textarea>
+        <button id="send-btn" type="button" title="Invia" aria-label="Invia">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 13V3M3 8l5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+      <p class="input-hint">Ricerca semantica vettoriale · Qdrant + Ollama RAG</p>
+    </div>
+  </footer>
+
+</div><!-- /#app -->
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
+<script src="qdrant-app.js" type="module"></script>
+</body>
+</html>
