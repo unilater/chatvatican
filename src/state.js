@@ -3,7 +3,7 @@ import path from "node:path";
 import { APP_STATE_FILE, DEFAULT_AGENT_MODEL } from "./config.js";
 
 export function getDefaultState() {
-  return { uiMode: "user", ragModel: DEFAULT_AGENT_MODEL, promptTemplate: "", sourceLimit: 10 };
+  return { uiMode: "user", ragModel: DEFAULT_AGENT_MODEL, promptTemplate: "", sourceLimit: 10, sidebarLimit: 10 };
 }
 
 function sanitize(raw) {
@@ -12,7 +12,8 @@ function sanitize(raw) {
     uiMode:         String(raw?.uiMode || "").toLowerCase() === "admin" ? "admin" : "user",
     ragModel:       String(raw?.ragModel       || d.ragModel).trim() || d.ragModel,
     promptTemplate: String(raw?.promptTemplate ?? ""),
-    sourceLimit:    Math.min(Math.max(Number(raw?.sourceLimit) || d.sourceLimit, 1), 50),
+    sourceLimit:    Math.min(Math.max(Number(raw?.sourceLimit)  || d.sourceLimit,  1),  50),
+    sidebarLimit:   Math.min(Math.max(Number(raw?.sidebarLimit) || d.sidebarLimit, 1), 100),
   };
 }
 

@@ -11,6 +11,7 @@ let isStreaming  = false;
 let abortCtrl   = null;
 let msgCounter  = 0;
 let sourceLimit = 10;
+let sidebarLimit = 10;
 let lastQuery   = "";
 let lastHits    = [];
 
@@ -411,6 +412,12 @@ async function loadState() {
       if (limitSel) limitSel.value = String(sourceLimit);
     }
 
+    if (typeof data.sidebarLimit === "number") {
+      sidebarLimit = data.sidebarLimit;
+      const sidebarSel = $("sidebar-limit");
+      if (sidebarSel) sidebarSel.value = String(sidebarLimit);
+    }
+
     if (data.ragModel) {
       const sel = $("model-select");
       if (sel) {
@@ -437,6 +444,7 @@ async function saveState() {
         promptTemplate: $("system-prompt")?.value ?? "",
         ragModel: $("model-select")?.value ?? "",
         sourceLimit: Number($("source-limit")?.value ?? sourceLimit),
+        sidebarLimit: Number($("sidebar-limit")?.value ?? sidebarLimit),
       }),
     });
     if (statusEl) {
@@ -494,11 +502,22 @@ function populateSidebar(hits) {
       chip.type = "button";
       chip.textContent = name;
       chip.addEventListener("click", () => {
-        const wasActive = chip.classList.contains("active");
-        chipsEl.querySelectorAll(".filter-chip").forEach(c => c.classList.remove("active"));
-        sidebarActiveFilters[key] = wasActive ? null : name;
-        if (!wasActive) chip.classList.add("active");
-        renderSidebarSources(hits);
+        const isActive = chip.dataset.active === "1";
+        // Reset tutti i chip del gruppo
+        chipsEl.querySelectorAll(".filter-chip").forEach(c => {
+          c.classList.remove("active");
+          c.dataset.active = "0";
+        });
+        if (isActive) {
+          // secondo click = deseleziona
+          sidebarActiveFilters[key] = null;
+        } else {
+          // primo click = seleziona
+          sidebarActiveFilters[key] = name;
+          chip.classList.add("active");
+          chip.dataset.active = "1";
+        }
+        renderSidebarSources(lastHits);
       });
       chipsEl.appendChild(chip);
     });
@@ -524,7 +543,7 @@ function renderSidebarSources(hits) {
   });
 
   sourcesEl.innerHTML = "";
-  filtered.forEach((hit, i) => {
+  filtered.slice(0, sidebarLimit).forEach((hit, i) => {
     const pl  = hit.payload ?? {};
     const { titolo, fonte, data, link } = getPayloadFields(pl);
     const safeLink = /^https?:\/\//i.test(link) ? link : "";
