@@ -100,8 +100,7 @@ app.post("/api/qdrant/search", async (req, res) => {
   try {
     const query      = String(req.body?.query      ?? "").trim();
     const collection = String(req.body?.collection ?? "").trim();
-    const limit      = Math.min(Math.max(Number(req.body?.limit  ?? 20), 1), 100);
-    const offset     = Math.max(Number(req.body?.offset ?? 0), 0);
+    const limit      = Math.min(Math.max(Number(req.body?.limit  ?? 1_000_000), 1), 1_000_000);
     const embedModel = String(req.body?.embedModel ?? QDRANT_EMBED_MODEL).trim() || QDRANT_EMBED_MODEL;
 
     if (!collection) return res.status(400).json({ error: "Collection obbligatoria" });
@@ -111,7 +110,7 @@ app.post("/api/qdrant/search", async (req, res) => {
     let searchMode = "scroll";
 
     if (query) {
-      // Tenta ricerca vettoriale con embedding Ollama
+      // Tenta ricerca vettoriale con embedding Ollama — limit altissimo: restituisce tutta la collection
       try {
         const vector = await generateEmbedding(query, embedModel);
         const r = await fetch(`${QDRANT_BASE_URL}/collections/${colPath}/points/search`, {
@@ -130,32 +129,12 @@ app.post("/api/qdrant/search", async (req, res) => {
         points = data.result ?? [];
         searchMode = "vector";
       } catch {
-        // Fallback: scroll senza filtro
-        const r = await fetch(`${QDRANT_BASE_URL}/collections/${colPath}/points/scroll`, {
-          method: "POST",
-          headers: qdrantHeaders(),
-          body: JSON.stringify({ limit, offset, with_payload: true, with_vectors: false }),
-        });
-        if (!r.ok) {
-          const text = await r.text();
-          throw new Error(`Qdrant scroll HTTP ${r.status}: ${text}`);
-        }
-        const data = await r.json();
-        points = (data.result?.points ?? []).map((p) => ({ id: p.id, payload: p.payload, score: null }));
+        // Fallback: scroll paginato senza filtro (tutti i documenti)
+        points = await scrollAll(colPath);
       }
     } else {
-      // Nessuna query: scroll senza filtro
-      const r = await fetch(`${QDRANT_BASE_URL}/collections/${colPath}/points/scroll`, {
-        method: "POST",
-        headers: qdrantHeaders(),
-        body: JSON.stringify({ limit, offset, with_payload: true, with_vectors: false }),
-      });
-      if (!r.ok) {
-        const text = await r.text();
-        throw new Error(`Qdrant scroll HTTP ${r.status}: ${text}`);
-      }
-      const data = await r.json();
-      points = (data.result?.points ?? []).map((p) => ({ id: p.id, payload: p.payload, score: null }));
+      // Nessuna query: scroll paginato (tutti i documenti)
+      points = await scrollAll(colPath);
     }
 
     res.json({ points, total: points.length, searchMode });
@@ -163,6 +142,77 @@ app.post("/api/qdrant/search", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ─── Scroll paginato: recupera TUTTI i punti di una collection ───────────────
+
+async function scrollAll(colPath) {
+  const all = [];
+  let nextOffset = null;
+  do {
+    const body = { limit: 10_000, with_payload: true, with_vectors: false };
+    if (nextOffset !== null) body.offset = nextOffset;
+    const r = await fetch(`${QDRANT_BASE_URL}/collections/${colPath}/points/scroll`, {
+      method: "POST",
+      headers: qdrantHeaders(),
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { const t = await r.text(); throw new Error(`Qdrant scroll: ${t}`); }
+    const data = await r.json();
+    for (const p of (data.result?.points ?? [])) {
+      all.push({ id: p.id, payload: p.payload, score: null });
+    }
+    nextOffset = data.result?.next_page_offset ?? null;
+  } while (nextOffset !== null);
+  return all;
+}
+
+// ─── Hybrid rerank ───────────────────────────────────────────────────────────
+
+/**
+ * Boost dei documenti il cui payload contiene le parole chiave della query.
+ * Utile per nomi propri, luoghi, enti che il vettore semantico non cattura bene
+ * (specie se i vettori sono stati costruiti su testi brevi/titoli).
+ *
+ * Strategia RRF-like semplificata:
+ *   finalScore = vectorScore * 0.7 + keywordBoost * 0.3
+ * dove keywordBoost = frazione di token della query trovati nel payload (0-1).
+ */
+function hybridRerank(points, query) {
+  if (!points.length) return points;
+
+  // Tokenizza query: parole di almeno 3 lettere, normalizzate
+  const tokens = query
+    .toLowerCase()
+    .replace(/[^\w\sàáâãäèéêëìíîïòóôõöùúûü]/g, " ")
+    .split(/\s+/)
+    .filter(t => t.length >= 3);
+
+  if (!tokens.length) return points;
+
+  return points
+    .map(p => {
+      const pl = p.payload ?? {};
+      // Campi da cercare (più specifici prima: nomi, enti, luoghi, poi testo)
+      const searchTarget = [
+        ...(Array.isArray(pl.persone) ? pl.persone : []),
+        ...(Array.isArray(pl.enti)    ? pl.enti    : []),
+        ...(Array.isArray(pl.luoghi)  ? pl.luoghi  : []),
+        pl.titolo ?? "", pl.fonte ?? "",
+        (pl.testo_originale ?? pl.testo ?? pl.text ?? ""),
+      ].join(" ").toLowerCase();
+
+      const matches = tokens.filter(t => searchTarget.includes(t)).length;
+      const keywordBoost = matches / tokens.length;
+
+      const vectorScore = typeof p.score === "number" ? p.score : 0;
+      // Se tutti i token matchano (es. nome proprio esatto), peso keyword più alto
+      const kw = matches === tokens.length ? 0.5 : 0.3;
+      const hybridScore = vectorScore * (1 - kw) + keywordBoost * kw;
+
+      return { ...p, score: hybridScore, _vectorScore: vectorScore, _keywordBoost: keywordBoost };
+    })
+    .sort((a, b) => b.score - a.score);
+}
 
 // Search + stream Ollama per Qdrant
 app.post("/api/qdrant/search-stream", async (req, res) => {
@@ -175,7 +225,11 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
   try {
     const query      = String(req.body?.query      ?? "").trim();
     const collection = String(req.body?.collection ?? "").trim();
-    const limit      = Math.min(Math.max(Number(req.body?.limit ?? 10), 1), 50);
+    // ctxLimit: quanti documenti top-ranked passare a Ollama come contesto (configurato dall'admin)
+    const ctxLimit   = Math.min(Math.max(Number(req.body?.limit ?? 10), 1), 100);
+    // Nessun limite: la ricerca vettoriale Qdrant esamina già tutti i punti (HNSW su tutta la collection);
+    // restituiamo al più tutti i documenti esistenti.
+    const qdrantLimit = 1_000_000;
     const embedModel = String(req.body?.embedModel ?? QDRANT_EMBED_MODEL).trim() || QDRANT_EMBED_MODEL;
     const model      = String(req.body?.model ?? DEFAULT_AGENT_MODEL).trim() || DEFAULT_AGENT_MODEL;
     const generateAnswer = req.body?.generateAnswer !== false;
@@ -200,27 +254,27 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
       const colPath = encodeURIComponent(collection);
       try {
         const vector = await generateEmbedding(query, embedModel);
+        // Cerca su tutta la collection (qdrantLimit alto), risultati già ordinati per score desc
         const r = await fetch(`${QDRANT_BASE_URL}/collections/${colPath}/points/search`, {
           method: "POST",
           headers: qdrantHeaders(),
-          body: JSON.stringify({ vector, limit, with_payload: true, with_vectors: false, score_threshold: 0.0 }),
+          body: JSON.stringify({ vector, limit: qdrantLimit, with_payload: true, with_vectors: false, score_threshold: 0.0 }),
         });
         if (!r.ok) throw new Error(`Qdrant search HTTP ${r.status}`);
         const data = await r.json();
         points = data.result ?? [];
         searchMode = "vector";
+
+        // Ricerca ibrida: boost dei documenti il cui payload contiene parole chiave della query
+        // (cattura nomi propri, luoghi, enti che il modello vettoriale potrebbe non rankare bene)
+        points = hybridRerank(points, query);
       } catch {
-        const r = await fetch(`${QDRANT_BASE_URL}/collections/${colPath}/points/scroll`, {
-          method: "POST",
-          headers: qdrantHeaders(),
-          body: JSON.stringify({ limit, with_payload: true, with_vectors: false }),
-        });
-        if (!r.ok) { const t = await r.text(); throw new Error(`Qdrant scroll: ${t}`); }
-        const data = await r.json();
-        points = (data.result?.points ?? []).map((p) => ({ id: p.id, payload: p.payload, score: null }));
+        // Fallback scroll paginato: recupera TUTTI i punti, nessun limite artificiale
+        points = await scrollAll(colPath);
       }
     }
 
+    // Invia al client tutti i risultati trovati (per mostrare rank e score)
     emit({ type: "hits", hits: points, total: points.length, searchMode });
 
     if (!generateAnswer) {
@@ -231,39 +285,43 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
     let fullAnswer = "";
 
     if (points.length === 0) {
-      const convPrompt =
-        `Sei un esperto di documenti cristiani e vaticani.\n` +
-        `Non hai trovato documenti pertinenti per: "${query}".\n` +
-        `Rispondi brevemente e in modo cordiale in italiano.`;
+      const convPrompt = customSystemPrompt
+        ? customSystemPrompt.replace(/\{\{query\}\}/g, query).replace(/\{\{context\}\}/g, "")
+        : query;
       await askOllamaStream(convPrompt, model, (tok) => {
         fullAnswer += tok;
         emit({ type: "token", text: tok });
       });
     } else {
-      const MAX_CTX = Math.min(points.length, 5);
+      // Passa a Ollama solo i top-ctxLimit per score (i più rilevanti semanticamente)
+      const MAX_CTX = Math.min(points.length, ctxLimit);
       const contextBlocks = points.slice(0, MAX_CTX).map((p, i) => {
         const pl = p.payload ?? {};
-        const titolo = String(pl.titolo ?? pl.title ?? pl.nome ?? "");
-        const testo  = String(pl.testo  ?? pl.text  ?? pl.content ?? pl.body ?? "").slice(0, 800);
-        const fonte  = String(pl.fonte  ?? pl.source ?? pl.autore ?? "");
-        const abstr  = String(pl.abstract ?? pl.summary ?? "");
-        return `[${i + 1}] ${titolo ? `Titolo: ${titolo}\n` : ""}${fonte ? `Fonte: ${fonte}\n` : ""}${abstr ? `Abstract: ${abstr}\n` : ""}${testo ? `Testo: ${testo}` : ""}`.trim();
+        const titolo  = String(pl.titolo ?? pl.title ?? pl.nome ?? "");
+        const testo   = String(pl.testo_originale ?? pl.testo ?? pl.text ?? pl.content ?? pl.body ?? "");
+        const fonte   = String(pl.fonte  ?? pl.source ?? pl.autore ?? "");
+        const abstr   = String(pl.abstract ?? pl.summary ?? "");
+        const persone = Array.isArray(pl.persone) ? pl.persone.join(", ") : (pl.persone ?? "");
+        const enti    = Array.isArray(pl.enti)    ? pl.enti.join(", ")    : (pl.enti    ?? "");
+        const luoghi  = Array.isArray(pl.luoghi)  ? pl.luoghi.join(", ")  : (pl.luoghi  ?? "");
+        return [
+          `[${i + 1}]`,
+          titolo  ? `Titolo: ${titolo}`    : "",
+          fonte   ? `Fonte: ${fonte}`      : "",
+          abstr   ? `Abstract: ${abstr}`   : "",
+          persone ? `Persone: ${persone}`  : "",
+          enti    ? `Enti: ${enti}`        : "",
+          luoghi  ? `Luoghi: ${luoghi}`    : "",
+          testo   ? `Testo: ${testo}`      : "",
+        ].filter(Boolean).join("\n");
       }).join("\n\n---\n\n");
 
-      let ragPrompt;
-      if (customSystemPrompt) {
-        ragPrompt = customSystemPrompt
-          .replace(/\{\{query\}\}/g, query)
-          .replace(/\{\{context\}\}/g, contextBlocks);
-      } else {
-        ragPrompt =
-          `Sei un esperto di documenti cristiani e vaticani.\n` +
-          `Rispondi in italiano alla domanda usando SOLO le fonti sotto.\n` +
-          `Cita le fonti con [1], [2] ecc. nel testo della risposta.\n` +
-          `Sii preciso, sintetico e chiaro.\n\n` +
-          `DOMANDA: ${query}\n\n` +
-          `FONTI:\n${contextBlocks}`;
-      }
+      const ragPrompt = customSystemPrompt
+        ? customSystemPrompt
+            .replace(/\{\{query\}\}/g, query)
+            .replace(/\{\{question\}\}/g, query)
+            .replace(/\{\{context\}\}/g, contextBlocks)
+        : `${query}\n\nContesto:\n${contextBlocks}`;
 
       await askOllamaStream(ragPrompt, model, (tok) => {
         fullAnswer += tok;

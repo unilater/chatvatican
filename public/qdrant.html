@@ -6,7 +6,9 @@
   <title>Archivio Cristiano</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <meta name="theme-color" content="#ffffff" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
   <link rel="stylesheet" href="search-styles.css" />
 </head>
 <body>
@@ -21,17 +23,7 @@
       Qdrant
     </span>
 
-    <div class="topbar-sep"></div>
-
-    <!-- Collection -->
-    <select id="collection-select" class="select-pill" title="Collection Qdrant" aria-label="Collection"></select>
-
     <div class="topbar-controls">
-      <!-- Model selector — admin only -->
-      <div id="model-wrap" class="hidden" title="Modello AI">
-        <select id="model-select" class="select-pill" aria-label="Modello AI"></select>
-      </div>
-
       <!-- Role switch -->
       <div class="role-switch" aria-label="Modalità vista">
         <button id="userModeBtn"  class="role-switch-btn" type="button" data-role="user"  aria-pressed="true">Utente</button>
@@ -52,20 +44,45 @@
     <div id="messages"></div>
   </main>
 
-  <!-- ── ADMIN PANEL (prompt editor) ── -->
+  <!-- ── ADMIN PANEL ── -->
   <div id="admin-panel" class="hidden">
     <div class="admin-panel-inner">
-      <div class="admin-panel-header">
-        <span class="admin-panel-title">Prompt RAG</span>
-        <span class="admin-panel-hint">Variabili: <code>{{query}}</code> e <code>{{context}}</code> — lascia vuoto per il default</span>
-        <div class="admin-panel-actions">
+
+      <!-- Riga 1: Collection + Modello + Fonti -->
+      <div class="admin-row">
+        <div class="admin-field">
+          <label class="admin-label" for="collection-select">Collection</label>
+          <select id="collection-select" class="select-pill" aria-label="Collection Qdrant"></select>
+        </div>
+        <div class="admin-field">
+          <label class="admin-label" for="model-select">Modello AI</label>
+          <select id="model-select" class="select-pill" aria-label="Modello AI"></select>
+        </div>
+        <div class="admin-field">
+          <label class="admin-label" for="source-limit">Fonti per risposta</label>
+          <select id="source-limit" class="select-pill" aria-label="Numero fonti">
+            <option value="3">3</option>
+            <option value="5">5</option>
+            <option value="8">8</option>
+            <option value="10">10</option>
+            <option value="16" selected>16</option>
+            <option value="20">20</option>
+            <option value="30">30</option>
+            <option value="50">50</option>
+          </select>
+        </div>
+        <div class="admin-field admin-field-actions">
           <span id="save-status" class="save-status"></span>
-          <button id="reset-prompt-btn" class="btn-admin" type="button">Reset</button>
+          <button id="reset-prompt-btn" class="btn-admin" type="button">Reset prompt</button>
           <button id="save-prompt-btn"  class="btn-admin primary" type="button">Salva</button>
         </div>
       </div>
+
+      <!-- Riga 2: Prompt -->
+      <div class="admin-prompt-label">Prompt RAG <span class="admin-panel-hint">variabili: <code>{{question}}</code> <code>{{context}}</code></span></div>
       <textarea id="system-prompt" class="prompt-editor" rows="4"
-        placeholder="Lascia vuoto per il prompt predefinito.&#10;Esempio: Sei un esperto di documenti vaticani. Rispondi in italiano.&#10;&#10;DOMANDA: {{query}}&#10;&#10;FONTI:&#10;{{context}}"></textarea>
+        placeholder="Lascia vuoto per nessun prompt.&#10;Esempio: Sei un esperto di documenti vaticani.&#10;&#10;DOMANDA: {{question}}&#10;&#10;FONTI:&#10;{{context}}"></textarea>
+
     </div>
   </div>
 

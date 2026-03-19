@@ -2,22 +2,15 @@
 
 // ─── Costanti ─────────────────────────────────────────────────────────────────
 
-const DEFAULT_PROMPT = `Sei un esperto di documenti cristiani e vaticani.
-Rispondi in italiano alla domanda usando SOLO le fonti sotto.
-Cita le fonti con [1], [2] ecc. nel testo della risposta.
-Sii preciso, sintetico e chiaro.
-
-DOMANDA: {{query}}
-
-FONTI:
-{{context}}`;
+// (nessun prompt di default nel codice — il prompt è gestito esclusivamente dall'admin via JSON)
 
 // ─── Stato ────────────────────────────────────────────────────────────────────
 
-let uiMode         = "user";
-let isStreaming    = false;
-let abortCtrl      = null;
-let msgCounter     = 0;
+let uiMode      = "user";
+let isStreaming  = false;
+let abortCtrl   = null;
+let msgCounter  = 0;
+let sourceLimit = 10;
 
 // ─── Utilità ─────────────────────────────────────────────────────────────────
 
@@ -49,7 +42,7 @@ function renderMarkdown(raw) {
 function getPayloadFields(payload = {}) {
   return {
     titolo : String(payload.titolo  ?? payload.title   ?? payload.nome    ?? payload.heading ?? "").trim(),
-    testo  : String(payload.testo   ?? payload.text    ?? payload.content ?? payload.body    ?? payload.descrizione ?? "").trim(),
+    testo  : String(payload.testo   ?? payload.testo_originale ?? payload.text ?? payload.content ?? payload.body ?? payload.descrizione ?? "").trim(),
     fonte  : String(payload.fonte   ?? payload.source  ?? payload.autore  ?? payload.author  ?? "").trim(),
     data   : String(payload.data    ?? payload.date    ?? payload.anno    ?? "").trim(),
     tipo   : String(payload.tipo_documento ?? payload.type ?? payload.categoria ?? "").trim(),
@@ -65,6 +58,56 @@ function scoreClass(score) {
   return "low";
 }
 
+// ─── Parsing streaming think ─────────────────────────────────────────────────
+
+/**
+ * Estrae blocchi <think> completi e, se presente, uno aperto (in progress).
+ * Restituisce { thinks: string[], thinkInProgress: string|null, text: string }
+ */
+function parseStream(raw) {
+  // Normalizza entity HTML nel caso il modello o un layer intermedio le codifichi
+  const normalized = raw
+    .replace(/&lt;think&gt;/gi, "<think>")
+    .replace(/&lt;\/think&gt;/gi, "</think>");
+
+  const completeThinks = [];
+  const re = /<think>([\s\S]*?)<\/think>/gi;
+  let m;
+  while ((m = re.exec(normalized)) !== null) completeThinks.push(m[1].trim());
+  let cleaned = normalized.replace(/<think>[\s\S]*?<\/think>/gi, "");
+  let thinkInProgress = null;
+  // Ricerca case-insensitive del tag aperto
+  const openMatch = cleaned.match(/<think>/i);
+  const openIdx = openMatch ? cleaned.toLowerCase().indexOf("<think>") : -1;
+  if (openIdx !== -1) {
+    thinkInProgress = cleaned.slice(openIdx + 7).trim();
+    cleaned = cleaned.slice(0, openIdx);
+  }
+  return { thinks: completeThinks, thinkInProgress, text: cleaned.trim() };
+}
+
+/**
+ * Costruisce l'HTML di una risposta:
+ * think inline (non collassabile) + markdown dell'answer.
+ */
+function buildAnswerHtml(thinks, thinkInProgress, text) {
+  const allThinks = [...thinks];
+  const hasInProgress = thinkInProgress !== null;
+  if (hasInProgress) allThinks.push(thinkInProgress);
+
+  let html = "";
+  if (allThinks.length) {
+    const items = allThinks.map((t, i) => {
+      const progressCls = hasInProgress && i === allThinks.length - 1
+        ? " think-in-progress" : "";
+      return `<span class="think-text${progressCls}">${escHtml(t)}</span>`;
+    }).join("");
+    html += `<div class="think-block"><div class="think-label">Ragionamento</div>${items}</div>`;
+  }
+  html += renderMarkdown(text);
+  return html;
+}
+
 // ─── Render sources ───────────────────────────────────────────────────────────
 
 function renderSources(hits, container, isAdmin) {
@@ -74,12 +117,12 @@ function renderSources(hits, container, isAdmin) {
   const list   = container.querySelector(".sources-list");
   if (!toggle || !list) return;
 
-  const n = Math.min(hits.length, 10);
-  toggle.innerHTML = `<span>${n} fonte${n !== 1 ? "i" : ""} trovata${n !== 1 ? "e" : ""}</span><span class="chevron">▾</span>`;
+  const n = Math.min(hits.length, sourceLimit);
+  toggle.innerHTML = `<span>${n} ${n !== 1 ? "fonti trovate" : "fonte trovata"}</span><span class="chevron">▾</span>`;
   toggle.classList.add("open");
   list.innerHTML = "";
 
-  hits.slice(0, 10).forEach((hit, i) => {
+  hits.slice(0, sourceLimit).forEach((hit, i) => {
     const pl = hit.payload ?? {};
     const { titolo, fonte, data, link, abstr, testo } = getPayloadFields(pl);
     const score  = typeof hit.score === "number" ? hit.score : null;
@@ -157,14 +200,17 @@ function appendAssistantMsg() {
 function updateAnswer(id, rawText) {
   const el = $(`answer-${id}`);
   if (!el) return;
-  el.textContent = rawText;   // testo grezzo durante streaming
+  const { thinks, thinkInProgress, text } = parseStream(rawText);
+  el.innerHTML = buildAnswerHtml(thinks, thinkInProgress, text);
   scrollToBottom();
 }
 
 function finalizeAnswer(id, rawText, hits) {
+  const { thinks, text: answerText } = parseStream(rawText);
+
   const el = $(`answer-${id}`);
   if (el) {
-    el.innerHTML = renderMarkdown(rawText);
+    el.innerHTML = buildAnswerHtml(thinks, null, answerText);
     el.querySelectorAll("a").forEach((a) => {
       a.target = "_blank"; a.rel = "noopener noreferrer";
     });
@@ -172,18 +218,22 @@ function finalizeAnswer(id, rawText, hits) {
       btn.addEventListener("click", () => highlightSource(id, Number(btn.dataset.n)));
     });
   }
+
   const sourcesEl = $(`sources-${id}`);
   if (sourcesEl && hits?.length) {
-    renderSources(hits, sourcesEl, uiMode === "admin");
+    // Mostra sempre le top-sourceLimit fonti; in modalità admin anche i punteggi
+    const displayHits = hits.slice(0, sourceLimit);
 
-    // Toggle show/hide sources
-    const toggle = sourcesEl.querySelector(".sources-toggle");
-    const list   = sourcesEl.querySelector(".sources-list");
-    toggle?.addEventListener("click", () => {
-      const open = toggle.classList.toggle("open");
-      if (list) list.style.display = open ? "" : "none";
-      toggle.setAttribute("aria-expanded", String(open));
-    });
+    if (displayHits.length) {
+      renderSources(displayHits, sourcesEl, uiMode === "admin");
+      const toggle = sourcesEl.querySelector(".sources-toggle");
+      const list   = sourcesEl.querySelector(".sources-list");
+      toggle?.addEventListener("click", () => {
+        const open = toggle.classList.toggle("open");
+        if (list) list.style.display = open ? "" : "none";
+        toggle.setAttribute("aria-expanded", String(open));
+      });
+    }
   }
   scrollToBottom();
 }
@@ -229,7 +279,7 @@ async function sendQuery(query) {
       body: JSON.stringify({
         query,
         collection,
-        limit: 10,
+        limit: sourceLimit,
         model,
         generateAnswer: true,
         systemPrompt: customPrompt,
@@ -320,7 +370,7 @@ function setUiMode(mode, save = true) {
   uiMode = mode === "admin" ? "admin" : "user";
   document.body.dataset.uiMode = uiMode;
   $("admin-panel")?.classList.toggle("hidden", uiMode !== "admin");
-  $("model-wrap")?.classList.toggle("hidden",  uiMode !== "admin");
+
   $("userModeBtn")?.setAttribute("aria-pressed",  String(uiMode === "user"));
   $("adminModeBtn")?.setAttribute("aria-pressed", String(uiMode === "admin"));
   if (save) saveState();
@@ -336,6 +386,12 @@ async function loadState() {
 
     const ta = $("system-prompt");
     if (ta && data.promptTemplate !== undefined) ta.value = data.promptTemplate;
+
+    if (typeof data.sourceLimit === "number") {
+      sourceLimit = data.sourceLimit;
+      const limitSel = $("source-limit");
+      if (limitSel) limitSel.value = String(sourceLimit);
+    }
 
     if (data.ragModel) {
       const sel = $("model-select");
@@ -362,6 +418,7 @@ async function saveState() {
         uiMode,
         promptTemplate: $("system-prompt")?.value ?? "",
         ragModel: $("model-select")?.value ?? "",
+        sourceLimit: Number($("source-limit")?.value ?? sourceLimit),
       }),
     });
     if (statusEl) {
@@ -392,6 +449,12 @@ function init() {
   $("reset-prompt-btn")?.addEventListener("click", () => {
     const ta = $("system-prompt");
     if (ta) ta.value = "";
+    saveState();
+  });
+
+  // Selettore fonti
+  $("source-limit")?.addEventListener("change", () => {
+    sourceLimit = Number($("source-limit").value) || 10;
     saveState();
   });
 
