@@ -596,6 +596,44 @@ function init() {
     sourceLimit = Number($("source-limit").value) || 10;
     saveState();
   });
+  $("sidebar-limit")?.addEventListener("change", () => {
+    sidebarLimit = Number($("sidebar-limit").value) || 10;
+    saveState();
+  });
+
+  // Duplicati index
+  $("find-dupes-btn")?.addEventListener("click", async () => {
+    const collection = $("collection-select")?.value;
+    if (!collection) return alert("Seleziona prima una collection.");
+    const btn = $("find-dupes-btn");
+    btn.disabled = true;
+    btn.textContent = "Scansione…";
+    try {
+      const res  = await fetch(`/api/qdrant/duplicates/${encodeURIComponent(collection)}`);
+      const data = await res.json();
+      if (data.error) { alert("Errore: " + data.error); return; }
+      if (!data.count) {
+        alert(`✅ Nessun duplicato trovato su ${data.total} documenti.`);
+        return;
+      }
+      const list = data.duplicates.map(d =>
+        `• "${d.titolo || "(senza titolo)"}" (id: ${d.id}) — duplicato di id: ${d.duplicateDi}`
+      ).join("\n");
+      const ok = confirm(
+        `Trovati ${data.count} duplicati su ${data.total} documenti:\n\n${list}\n\nEliminare i duplicati dall'index? (irreversibile)`
+      );
+      if (!ok) return;
+      const del = await fetch(`/api/qdrant/duplicates/${encodeURIComponent(collection)}`, { method: "DELETE" });
+      const delData = await del.json();
+      if (delData.error) { alert("Errore eliminazione: " + delData.error); return; }
+      alert(`✅ Eliminati ${delData.deleted} duplicati dall'index.`);
+    } catch (e) {
+      alert("Errore: " + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "🔍 Duplicati";
+    }
+  });
 
   // Input textarea
   const input = $("query-input");

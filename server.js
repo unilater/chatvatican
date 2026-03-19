@@ -166,6 +166,46 @@ async function scrollAll(colPath) {
   return all;
 }
 
+// ─── Deduplicazione risultati ────────────────────────────────────────────────
+
+/**
+ * Rimuove hit quasi-identici dalla lista risultati.
+ * Strategia: fingerprint = titolo normalizzato + primi 500 char del testo normalizzato.
+ * Tra più documenti con lo stesso fingerprint mantiene solo quello con score più alto
+ * (che è sempre il primo dopo hybridRerank).
+ */
+/**
+ * Normalizza un testo per il confronto fingerprint:
+ * - minuscolo
+ * - rimuove date numeriche tipo 19.01.2000 / 19/01/2000 (causa principale dei falsi negativi)
+ * - normalizza whitespace multipli (inclusi a-capo)
+ * - riunisce cifre spezzate da un a-capo (es. "11.3\n0" → "11.30")
+ */
+function normalizeForFP(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}/g, " ")  // strip date numeriche
+    .replace(/\s+/g, " ")
+    .replace(/(\d) (\d)/g, "$1$2")  // ricollega numeri spezzati da a-capo
+    .trim();
+}
+
+function deduplicateHits(points, fingerLen = 500) {
+  const seen = new Map();
+  const out = [];
+  for (const p of points) {
+    const pl = p.payload ?? {};
+    const testo  = normalizeForFP(pl.testo_originale ?? pl.testo ?? pl.text ?? "").slice(0, fingerLen);
+    const titolo = normalizeForFP(pl.titolo ?? pl.title ?? "");
+    const fp = titolo + "|||" + testo;
+    if (!seen.has(fp)) {
+      seen.set(fp, true);
+      out.push(p);
+    }
+  }
+  return out;
+}
+
 // ─── Hybrid rerank ───────────────────────────────────────────────────────────
 
 /**
@@ -272,6 +312,9 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
         // Fallback scroll paginato: recupera TUTTI i punti, nessun limite artificiale
         points = await scrollAll(colPath);
       }
+
+      // Rimuove duplicati quasi-identici (stesso titolo + stesso testo iniziale)
+      points = deduplicateHits(points);
     }
 
     // Invia al client tutti i risultati trovati (per mostrare rank e score)
@@ -335,6 +378,62 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
   }
 
   res.end();
+});
+
+// ─── Admin: trova duplicati in una collection ────────────────────────────────
+
+app.get("/api/qdrant/duplicates/:collection", async (req, res) => {
+  const collection = String(req.params.collection ?? "").trim();
+  if (!collection) return res.status(400).json({ error: "Collection obbligatoria" });
+  try {
+    const points = await scrollAll(encodeURIComponent(collection));
+    const seen = new Map(); // fp → punto mantenuto
+    const duplicates = []; // punti da eliminare
+    for (const p of points) {
+      const pl = p.payload ?? {};
+      const testo  = normalizeForFP(pl.testo_originale ?? pl.testo ?? pl.text ?? "").slice(0, 500);
+      const titolo = normalizeForFP(pl.titolo ?? pl.title ?? "");
+      const fp = titolo + "|||" + testo;
+      if (seen.has(fp)) {
+        duplicates.push({ id: p.id, titolo: pl.titolo ?? pl.title ?? "", duplicateDi: seen.get(fp) });
+      } else {
+        seen.set(fp, p.id);
+      }
+    }
+    res.json({ total: points.length, duplicates, count: duplicates.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Admin: cancella duplicati da una collection (irreversibile!)
+app.delete("/api/qdrant/duplicates/:collection", async (req, res) => {
+  const collection = String(req.params.collection ?? "").trim();
+  if (!collection) return res.status(400).json({ error: "Collection obbligatoria" });
+  try {
+    const points = await scrollAll(encodeURIComponent(collection));
+    const seen = new Map();
+    const toDelete = [];
+    for (const p of points) {
+      const pl = p.payload ?? {};
+      const testo  = normalizeForFP(pl.testo_originale ?? pl.testo ?? pl.text ?? "").slice(0, 500);
+      const titolo = normalizeForFP(pl.titolo ?? pl.title ?? "");
+      const fp = titolo + "|||" + testo;
+      if (seen.has(fp)) { toDelete.push(p.id); } else { seen.set(fp, p.id); }
+    }
+    if (!toDelete.length) return res.json({ deleted: 0, message: "Nessun duplicato trovato." });
+
+    const colPath = encodeURIComponent(collection);
+    const r = await fetch(`${QDRANT_BASE_URL}/collections/${colPath}/points/delete`, {
+      method: "POST",
+      headers: qdrantHeaders(),
+      body: JSON.stringify({ points: toDelete }),
+    });
+    if (!r.ok) { const t = await r.text(); throw new Error(`Qdrant delete: ${t}`); }
+    res.json({ deleted: toDelete.length, ids: toDelete });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── Avvio ───────────────────────────────────────────────────────────────────
