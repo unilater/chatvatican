@@ -208,50 +208,9 @@ function deduplicateHits(points, fingerLen = 500) {
 
 // ─── Hybrid rerank ───────────────────────────────────────────────────────────
 
-/**
- * Boost dei documenti il cui payload contiene le parole chiave della query.
- * Utile per nomi propri, luoghi, enti che il vettore semantico non cattura bene
- * (specie se i vettori sono stati costruiti su testi brevi/titoli).
- *
- * Strategia RRF-like semplificata:
- *   finalScore = vectorScore * 0.7 + keywordBoost * 0.3
- * dove keywordBoost = frazione di token della query trovati nel payload (0-1).
- */
-function hybridRerank(points, query) {
-  if (!points.length) return points;
-
-  // Tokenizza query: parole di almeno 3 lettere, normalizzate
-  const tokens = query
-    .toLowerCase()
-    .replace(/[^\w\sàáâãäèéêëìíîïòóôõöùúûü]/g, " ")
-    .split(/\s+/)
-    .filter(t => t.length >= 3);
-
-  if (!tokens.length) return points;
-
-  return points
-    .map(p => {
-      const pl = p.payload ?? {};
-      // Campi da cercare (più specifici prima: nomi, enti, luoghi, poi testo)
-      const searchTarget = [
-        ...(Array.isArray(pl.persone) ? pl.persone : []),
-        ...(Array.isArray(pl.enti)    ? pl.enti    : []),
-        ...(Array.isArray(pl.luoghi)  ? pl.luoghi  : []),
-        pl.titolo ?? "", pl.fonte ?? "",
-        (pl.testo_originale ?? pl.testo ?? pl.text ?? ""),
-      ].join(" ").toLowerCase();
-
-      const matches = tokens.filter(t => searchTarget.includes(t)).length;
-      const keywordBoost = matches / tokens.length;
-
-      const vectorScore = typeof p.score === "number" ? p.score : 0;
-      // Se tutti i token matchano (es. nome proprio esatto), peso keyword più alto
-      const kw = matches === tokens.length ? 0.5 : 0.3;
-      const hybridScore = vectorScore * (1 - kw) + keywordBoost * kw;
-
-      return { ...p, score: hybridScore, _vectorScore: vectorScore, _keywordBoost: keywordBoost };
-    })
-    .sort((a, b) => b.score - a.score);
+// Seleziona i top-N punti per il contesto LLM (ordinamento già per score desc da Qdrant)
+function selectContextPoints(points, limit) {
+  return points.slice(0, limit);
 }
 
 // Search + stream Ollama per Qdrant
@@ -274,7 +233,7 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
     const model      = String(req.body?.model ?? DEFAULT_AGENT_MODEL).trim() || DEFAULT_AGENT_MODEL;
     const generateAnswer = req.body?.generateAnswer !== false;
     const customSystemPrompt = String(req.body?.systemPrompt ?? "").trim();
-    const preloadedHits = Array.isArray(req.body?.hits) ? req.body.hits : null;
+    const preloadedHits  = Array.isArray(req.body?.hits) ? req.body.hits : null;
 
     if (!query) {
       emit({ type: "error", error: "Query obbligatoria." });
@@ -304,10 +263,8 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
         const data = await r.json();
         points = data.result ?? [];
         searchMode = "vector";
-
-        // Ricerca ibrida: boost dei documenti il cui payload contiene parole chiave della query
-        // (cattura nomi propri, luoghi, enti che il modello vettoriale potrebbe non rankare bene)
-        points = hybridRerank(points, query);
+        // Normalizza score 0-1 → 0-100 per il display nella UI
+        points = points.map(p => ({ ...p, _vectorScore: p.score, score: (p.score ?? 0) * 100 }));
       } catch {
         // Fallback scroll paginato: recupera TUTTI i punti, nessun limite artificiale
         points = await scrollAll(colPath);
@@ -317,10 +274,8 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
       points = deduplicateHits(points);
     }
 
-    // Invia al client tutti i risultati trovati (per mostrare rank e score)
-    emit({ type: "hits", hits: points, total: points.length, searchMode });
-
     if (!generateAnswer) {
+      emit({ type: "hits", hits: points, total: points.length, searchMode });
       emit({ type: "done", answer: "" });
       return res.end();
     }
@@ -328,6 +283,7 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
     let fullAnswer = "";
 
     if (points.length === 0) {
+      emit({ type: "hits", hits: [], total: 0, searchMode });
       const convPrompt = customSystemPrompt
         ? customSystemPrompt.replace(/\{\{query\}\}/g, query).replace(/\{\{context\}\}/g, "")
         : query;
@@ -336,9 +292,19 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
         emit({ type: "token", text: tok });
       });
     } else {
-      // Passa a Ollama solo i top-ctxLimit per score (i più rilevanti semanticamente)
+      // Seleziona i top-N documenti da passare al LLM (ordinati per score vettoriale desc).
       const MAX_CTX = Math.min(points.length, ctxLimit);
-      const contextBlocks = points.slice(0, MAX_CTX).map((p, i) => {
+      const ctxPoints = selectContextPoints(points, MAX_CTX);
+
+      // IMPORTANTE: emetti hits nell'ordine in cui il LLM li vede ([1],[2]...).
+      // Così le citazioni nella risposta corrispondono alle card mostrate all'utente.
+      const ctxIds = new Set(ctxPoints.map(p => p.id));
+      const hitsForClient = [
+        ...ctxPoints,                                    // [1],[2]... = esattamente ciò che vede il LLM
+        ...points.filter(p => !ctxIds.has(p.id)),        // resto per la sidebar
+      ];
+      emit({ type: "hits", hits: hitsForClient, total: points.length, searchMode });
+      const contextBlocks = ctxPoints.map((p, i) => {
         const pl = p.payload ?? {};
         const titolo  = String(pl.titolo ?? pl.title ?? pl.nome ?? "");
         const testo   = String(pl.testo_originale ?? pl.testo ?? pl.text ?? pl.content ?? pl.body ?? "");
@@ -357,14 +323,18 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
           luoghi  ? `Luoghi: ${luoghi}`    : "",
           testo   ? `Testo: ${testo}`      : "",
         ].filter(Boolean).join("\n");
-      }).join("\n\n---\n\n");
+      });
+      // "Lost in the Middle": i LLM danno più peso alla fine del contesto.
+      // Invertiamo l'ordine nel prompt: [1] (più rilevante) appare per ultimo,
+      // subito prima della domanda, massimizzando l'attenzione del modello.
+      const contextString = [...contextBlocks].reverse().join("\n\n---\n\n");
 
       const ragPrompt = customSystemPrompt
         ? customSystemPrompt
             .replace(/\{\{query\}\}/g, query)
             .replace(/\{\{question\}\}/g, query)
-            .replace(/\{\{context\}\}/g, contextBlocks)
-        : `${query}\n\nContesto:\n${contextBlocks}`;
+            .replace(/\{\{context\}\}/g, contextString)
+        : `${query}\n\nContesto:\n${contextString}`;
 
       await askOllamaStream(ragPrompt, model, (tok) => {
         fullAnswer += tok;

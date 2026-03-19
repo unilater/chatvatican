@@ -568,6 +568,19 @@ textarea { font-family: inherit; }
 }
 .citation:hover { background: var(--accent); color: #fff; }
 
+.answer-fonti {
+  margin-top: 1.2em;
+  padding-top: .9em;
+  border-top: 1px solid var(--border);
+  font-size: .92em;
+  color: var(--text-2);
+}
+.answer-fonti p { margin-bottom: .4em; }
+.answer-fonti ul { list-style: none; padding: 0; margin: 0; }
+.answer-fonti li { display: flex; align-items: baseline; gap: 6px; padding: 2px 0; }
+.answer-fonti a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.answer-fonti a:hover { opacity: .8; }
+
 /* Typing indicator */
 
 .typing-dots {

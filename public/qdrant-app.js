@@ -56,8 +56,8 @@ function getPayloadFields(payload = {}) {
 
 function scoreClass(score) {
   if (score === null || score === undefined) return "mid";
-  if (score >= 0.75) return "high";
-  if (score >= 0.45) return "mid";
+  if (score >= 75) return "high";
+  if (score >= 45) return "mid";
   return "low";
 }
 
@@ -128,8 +128,10 @@ function renderSources(hits, container, isAdmin) {
   hits.slice(0, sourceLimit).forEach((hit, i) => {
     const pl = hit.payload ?? {};
     const { titolo, fonte, data, link, abstr, testo } = getPayloadFields(pl);
-    const score  = typeof hit.score === "number" ? hit.score : null;
-    const pct    = score !== null ? Math.round(score * 100) : null;
+    const score       = typeof hit.score === "number" ? hit.score : null;
+    const vectorScore  = typeof hit._vectorScore === "number" ? hit._vectorScore : null;
+    const pct          = score !== null ? Math.round(score) : null;        // score già in scala 0-100
+    const vPct         = vectorScore !== null ? Math.round(vectorScore * 100) : null;
     const safeLink = /^https?:\/\//i.test(link) ? link : "";
     const snip   = (abstr || testo).slice(0, 120);
 
@@ -145,10 +147,11 @@ function renderSources(hits, container, isAdmin) {
         <div class="source-meta">${[fonte, formatDate(data)].filter(Boolean).map(escHtml).join(" · ")}</div>
         ${snip ? `<div class="source-meta" style="margin-top:2px">${escHtml(snip)}…</div>` : ""}
       </div>
-      ${isAdmin && pct !== null ? `
+      ${isAdmin ? `
         <div class="source-score">
-          <span class="score-label">${pct}%</span>
-          <div class="score-bar-track"><div class="score-bar-fill ${scoreClass(score)}" style="width:${pct}%"></div></div>
+          <span class="score-label" title="Score vettoriale (cosine ×100)">${pct !== null ? pct : "—"}</span>
+          <div class="score-bar-track"><div class="score-bar-fill ${scoreClass(score)}" style="width:${Math.min(pct ?? 0, 100)}%"></div></div>
+          ${vPct !== null ? `<span class="score-label" style="color:var(--text-3);font-weight:400" title="Vector score (Qdrant cosine)">vec ${vPct}</span>` : ""}
         </div>` : ""}`;
 
     list.appendChild(card);
@@ -211,15 +214,47 @@ function updateAnswer(id, rawText) {
 function finalizeAnswer(id, rawText, hits, isDeepDive = false) {
   const { thinks, text: answerText } = parseStream(rawText);
 
+  // Separa il corpo dalla sezione "Fonti pertinenti:" scritta dall'LLM.
+  // L'LLM a volte scrive titoli errati/abbreviati — la sostituiamo con dati reali.
+  const fontiSplit = answerText.search(/\n[\s]*fonti\s+pertinenti[:\s]/i);
+  const bodyText   = fontiSplit >= 0 ? answerText.slice(0, fontiSplit).trim() : answerText;
+
   const el = $(`answer-${id}`);
   if (el) {
-    el.innerHTML = buildAnswerHtml(thinks, null, answerText);
+    el.innerHTML = buildAnswerHtml(thinks, null, bodyText);
     el.querySelectorAll("a").forEach((a) => {
       a.target = "_blank"; a.rel = "noopener noreferrer";
     });
     el.querySelectorAll(".citation").forEach((btn) => {
       btn.addEventListener("click", () => highlightSource(id, Number(btn.dataset.n)));
     });
+
+    // Raccoglie i numeri [N] citati nel corpo della risposta
+    const citedNums = [...new Set(
+      [...(bodyText.matchAll(/\[(\d+)\]/g))].map(m => Number(m[1]))
+    )].filter(n => n >= 1 && hits && n <= hits.length).sort((a, b) => a - b);
+
+    // Aggiunge sezione "Fonti pertinenti" con titoli reali dagli hits
+    if (citedNums.length && hits?.length) {
+      const items = citedNums.map(n => {
+        const pl    = hits[n - 1]?.payload ?? {};
+        const { titolo, fonte, link } = getPayloadFields(pl);
+        const safeLink = /^https?:\/\//i.test(link) ? link : "";
+        const label = escHtml(titolo || `Fonte ${n}`);
+        const meta  = fonte ? ` — ${escHtml(fonte)}` : "";
+        const inner = safeLink
+          ? `<a href="${escHtml(safeLink)}" target="_blank" rel="noopener noreferrer">${label}</a>${meta}`
+          : `${label}${meta}`;
+        return `<li><button class="citation" data-n="${n}" aria-label="Fonte ${n}">[${n}]</button> ${inner}</li>`;
+      }).join("");
+      const fontiEl = document.createElement("div");
+      fontiEl.className = "answer-fonti";
+      fontiEl.innerHTML = `<p><strong>Fonti pertinenti:</strong></p><ul>${items}</ul>`;
+      fontiEl.querySelectorAll(".citation").forEach((btn) => {
+        btn.addEventListener("click", () => highlightSource(id, Number(btn.dataset.n)));
+      });
+      el.appendChild(fontiEl);
+    }
   }
 
   const sourcesEl = $(`sources-${id}`);
@@ -264,7 +299,13 @@ async function sendQuery(query, preloadedHits = null) {
 
   const collection = $("collection-select")?.value || "";
   if (!collection) {
-    alert("Seleziona una collection Qdrant prima di cercare.");
+    alert("Seleziona una collection (indice) nel pannello admin.");
+    return;
+  }
+
+  const embedModel = $("embed-model-input")?.value?.trim() || "";
+  if (!embedModel) {
+    alert("Imposta il modello di embedding nel pannello admin.");
     return;
   }
 
@@ -296,6 +337,7 @@ async function sendQuery(query, preloadedHits = null) {
       body: JSON.stringify({
         query,
         collection,
+        embedModel,
         limit: sourceLimit,
         model,
         generateAnswer: true,
@@ -359,7 +401,7 @@ async function loadCollections() {
     if (data.error) { sel.innerHTML = `<option value="">Errore Qdrant</option>`; return; }
     const cols = data.result?.collections ?? [];
     sel.innerHTML = cols.length
-      ? cols.map((c) => `<option value="${escHtml(c.name)}">${escHtml(c.name)}</option>`).join("")
+      ? `<option value="">— Scegli collection —</option>` + cols.map((c) => `<option value="${escHtml(c.name)}">${escHtml(c.name)}</option>`).join("")
       : `<option value="">Nessuna collection</option>`;
   } catch {
     sel.innerHTML = `<option value="">Qdrant non raggiungibile</option>`;
@@ -429,6 +471,18 @@ async function loadState() {
         }
       }
     }
+
+    if (data.qdrantCollection) {
+      const colSel = $("collection-select");
+      if (colSel && colSel.querySelector(`option[value="${data.qdrantCollection}"]`)) {
+        colSel.value = data.qdrantCollection;
+      }
+    }
+
+    if (data.embedModel !== undefined) {
+      const emEl = $("embed-model-input");
+      if (emEl) emEl.value = data.embedModel;
+    }
   } catch { /* ignora */ }
 }
 
@@ -445,6 +499,8 @@ async function saveState() {
         ragModel: $("model-select")?.value ?? "",
         sourceLimit: Number($("source-limit")?.value ?? sourceLimit),
         sidebarLimit: Number($("sidebar-limit")?.value ?? sidebarLimit),
+        qdrantCollection: $("collection-select")?.value ?? "",
+        embedModel: $("embed-model-input")?.value?.trim() ?? "",
       }),
     });
     if (statusEl) {
@@ -654,9 +710,12 @@ function init() {
     if (q) { sendQuery(q); input.value = ""; autoResize(input); }
   });
 
-  // Carica dati
-  loadCollections();
-  loadModels().then(() => loadState());
+  // Cambiamenti admin persistiti
+  $("collection-select")?.addEventListener("change", saveState);
+  $("embed-model-input")?.addEventListener("change", saveState);
+
+  // Carica dati (parallelo, poi ripristina stato)
+  Promise.all([loadCollections(), loadModels()]).then(() => loadState());
 }
 
 init();

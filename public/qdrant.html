@@ -56,11 +56,15 @@
   <div id="admin-panel" class="hidden">
     <div class="admin-panel-inner">
 
-      <!-- Riga 1: Collection + Modello + Fonti -->
+      <!-- Riga 1: Collection + Embedding + Modello + Fonti -->
       <div class="admin-row">
         <div class="admin-field">
-          <label class="admin-label" for="collection-select">Collection</label>
+          <label class="admin-label" for="collection-select">Collection (indice)</label>
           <select id="collection-select" class="select-pill" aria-label="Collection Qdrant"></select>
+        </div>
+        <div class="admin-field">
+          <label class="admin-label" for="embed-model-input">Modello embedding</label>
+          <input id="embed-model-input" class="select-pill" type="text" placeholder="es. nomic-embed-text" autocomplete="off" style="min-width:160px" />
         </div>
         <div class="admin-field">
           <label class="admin-label" for="model-select">Modello AI</label>
@@ -90,6 +94,7 @@
             <option value="100">100</option>
           </select>
         </div>
+
         <div class="admin-field admin-field-actions">
           <span id="save-status" class="save-status"></span>
           <button id="reset-prompt-btn" class="btn-admin" type="button">Reset prompt</button>
