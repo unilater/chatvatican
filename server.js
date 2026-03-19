@@ -48,6 +48,39 @@ function qdrantHeaders() {
   return h;
 }
 
+// Sparse BM25-style vector (TF locale; Qdrant applica IDF con modifier:"idf")
+function computeSparseVector(text) {
+  const tokens = text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(t => t.length >= 3);
+
+  if (tokens.length === 0) return { indices: [], values: [] };
+
+  const tf = {};
+  for (const token of tokens) tf[token] = (tf[token] || 0) + 1;
+
+  const VOCAB_SIZE = 30000;
+  const seen = {};
+  for (const [token, count] of Object.entries(tf)) {
+    let hash = 2166136261;
+    for (let i = 0; i < token.length; i++) {
+      hash ^= token.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    const idx = (hash >>> 0) % VOCAB_SIZE;
+    const val = count / tokens.length;
+    if (seen[idx] === undefined || val > seen[idx]) seen[idx] = val;
+  }
+
+  const indices = Object.keys(seen).map(Number);
+  const values  = indices.map(i => seen[i]);
+  return { indices, values };
+}
+
 // Genera embedding via Ollama (modello nomic-embed-text o configurato)
 async function generateEmbedding(text, model) {
   const r = await fetch(`${OLLAMA_BASE_URL}/api/embeddings`, {
@@ -252,19 +285,52 @@ app.post("/api/qdrant/search-stream", async (req, res) => {
     } else {
       const colPath = encodeURIComponent(collection);
       try {
-        const vector = await generateEmbedding(query, embedModel);
-        // Cerca su tutta la collection (qdrantLimit alto), risultati già ordinati per score desc
-        const r = await fetch(`${QDRANT_BASE_URL}/collections/${colPath}/points/search`, {
-          method: "POST",
-          headers: qdrantHeaders(),
-          body: JSON.stringify({ vector, limit: qdrantLimit, with_payload: true, with_vectors: false, score_threshold: 0.0 }),
-        });
-        if (!r.ok) throw new Error(`Qdrant search HTTP ${r.status}`);
-        const data = await r.json();
-        points = data.result ?? [];
-        searchMode = "vector";
-        // Normalizza score 0-1 → 0-100 per il display nella UI
-        points = points.map(p => ({ ...p, _vectorScore: p.score, score: (p.score ?? 0) * 100 }));
+        const denseVector = await generateEmbedding(query, embedModel);
+        const sparseVector = computeSparseVector(query);
+
+        // Tenta prima hybrid search (prefetch dense+sparse → RRF fusion)
+        let hybridOk = false;
+        try {
+          const PREFETCH_LIMIT = 1000;
+          const r = await fetch(`${QDRANT_BASE_URL}/collections/${colPath}/points/query`, {
+            method: "POST",
+            headers: qdrantHeaders(),
+            body: JSON.stringify({
+              prefetch: [
+                { query: denseVector,  using: "dense",  limit: PREFETCH_LIMIT },
+                { query: sparseVector, using: "sparse", limit: PREFETCH_LIMIT },
+              ],
+              query: { fusion: "rrf" },
+              limit: PREFETCH_LIMIT,
+              with_payload: true,
+              with_vectors: false,
+            }),
+          });
+          if (!r.ok) throw new Error(`Qdrant hybrid HTTP ${r.status}`);
+          const data = await r.json();
+          const raw = data.result?.points ?? [];
+          if (raw.length > 0) {
+            // Normalizza RRF score relativo al top: top doc = 100
+            const maxScore = raw[0].score ?? 1;
+            points = raw.map(p => ({ ...p, _hybridScore: p.score, score: maxScore > 0 ? (p.score / maxScore) * 100 : 0 }));
+            searchMode = "hybrid";
+            hybridOk = true;
+          }
+        } catch { /* non ha sparse vectors: usa solo dense */ }
+
+        if (!hybridOk) {
+          // Fallback: ricerca solo vettoriale densa
+          const r = await fetch(`${QDRANT_BASE_URL}/collections/${colPath}/points/search`, {
+            method: "POST",
+            headers: qdrantHeaders(),
+            body: JSON.stringify({ vector: denseVector, limit: qdrantLimit, with_payload: true, with_vectors: false, score_threshold: 0.0 }),
+          });
+          if (!r.ok) throw new Error(`Qdrant search HTTP ${r.status}`);
+          const data = await r.json();
+          points = data.result ?? [];
+          searchMode = "vector";
+          points = points.map(p => ({ ...p, _vectorScore: p.score, score: (p.score ?? 0) * 100 }));
+        }
       } catch {
         // Fallback scroll paginato: recupera TUTTI i punti, nessun limite artificiale
         points = await scrollAll(colPath);

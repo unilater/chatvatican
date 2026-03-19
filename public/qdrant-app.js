@@ -130,8 +130,10 @@ function renderSources(hits, container, isAdmin) {
     const { titolo, fonte, data, link, abstr, testo } = getPayloadFields(pl);
     const score       = typeof hit.score === "number" ? hit.score : null;
     const vectorScore  = typeof hit._vectorScore === "number" ? hit._vectorScore : null;
+    const hybridScore  = typeof hit._hybridScore === "number" ? hit._hybridScore : null;
     const pct          = score !== null ? Math.round(score) : null;        // score già in scala 0-100
     const vPct         = vectorScore !== null ? Math.round(vectorScore * 100) : null;
+    const isHybrid     = hybridScore !== null;
     const safeLink = /^https?:\/\//i.test(link) ? link : "";
     const snip   = (abstr || testo).slice(0, 120);
 
@@ -149,9 +151,9 @@ function renderSources(hits, container, isAdmin) {
       </div>
       ${isAdmin ? `
         <div class="source-score">
-          <span class="score-label" title="Score vettoriale (cosine ×100)">${pct !== null ? pct : "—"}</span>
+          <span class="score-label" title="${isHybrid ? 'Score ibrido (RRF dense+sparse, normalizzato)' : 'Score vettoriale (cosine ×100)'}">${pct !== null ? pct : "—"}</span>
           <div class="score-bar-track"><div class="score-bar-fill ${scoreClass(score)}" style="width:${Math.min(pct ?? 0, 100)}%"></div></div>
-          ${vPct !== null ? `<span class="score-label" style="color:var(--text-3);font-weight:400" title="Vector score (Qdrant cosine)">vec ${vPct}</span>` : ""}
+          ${isHybrid ? `<span class="score-label" style="color:var(--text-3);font-weight:400" title="Hybrid RRF score">hybrid</span>` : vPct !== null ? `<span class="score-label" style="color:var(--text-3);font-weight:400" title="Vector score (Qdrant cosine)">vec ${vPct}</span>` : ""}
         </div>` : ""}`;
 
     list.appendChild(card);
