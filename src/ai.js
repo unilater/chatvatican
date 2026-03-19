@@ -2,6 +2,7 @@
 
 import { OLLAMA_BASE_URL, OLLAMA_NON_STREAM_TIMEOUT_MS } from "./config.js";
 
+
 // Chiama Ollama e aspetta la risposta completa (non streaming)
 export async function askOllama(prompt, model, timeoutMs = OLLAMA_NON_STREAM_TIMEOUT_MS) {
   const controller = new AbortController();

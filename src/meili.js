@@ -17,8 +17,9 @@ const HIGHLIGHT_POST = "\x03";
 const HIGHLIGHT_FIELDS = ["titolo", "abstract", "testo_originale"];
 const CROP_FIELDS      = ["testo_originale:150", "abstract:100"];
 
-// Facets di default da richiedere a Meilisearch
-export const DEFAULT_FACETS = ["fonte", "tipo_documento", "autore"];
+// Facets di default — devono corrispondere ai filterableAttributes dell'indice Meilisearch
+// Indice attuale: data, persone, luoghi, enti
+export const DEFAULT_FACETS = ["persone", "luoghi", "enti"];
 
 function getBaseUrl() {
   const url = new URL(SEARCH_INDEX_URL);

@@ -290,6 +290,7 @@ async function generateAiAnswer(query, hits) {
       limit: 5,
       model,
       generateAnswer: true,
+      hits: hits.slice(0, 5),  // passa i primi 5 hits già caricati
     };
     if (customPrompt) body.systemPrompt = customPrompt;
 
@@ -637,7 +638,8 @@ function init() {
         if (input) {
           input.value = q;
           input.dispatchEvent(new Event("input", { bubbles: true }));
-          input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+          input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, bubbles: true }));
+          input.closest("form")?.dispatchEvent(new Event("submit", { bubbles: true }));
         }
       });
       hintContainer.appendChild(btn);
@@ -656,6 +658,8 @@ function init() {
       setTimeout(() => {
         input.value = q;
         input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, bubbles: true }));
+        input.closest("form")?.dispatchEvent(new Event("submit", { bubbles: true }));
       }, 50);
     }
   });
@@ -695,7 +699,8 @@ function init() {
       placeholder: "Cerca encicliche, discorsi, lettere apostoliche...",
       showLoadingIndicator: true,
       showReset:   true,
-      showSubmit:  false,
+      showSubmit:  true,
+      searchAsYouType: false,
     }),
     instantsearch.widgets.pagination({
       container: "#pagination",

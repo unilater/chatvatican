@@ -2,6 +2,7 @@
 
 import express from "express";
 import { askOllama, askOllamaStream } from "./src/ai.js";
+import { rewriteQueryForSearch } from "./src/query-rewrite.js";
 import { searchDocuments, DEFAULT_FACETS } from "./src/meili.js";
 import { readUiState, writeUiState, normalizeUiScope } from "./src/state.js";
 import { DEFAULT_AGENT_MODEL, OLLAMA_BASE_URL, DEFAULT_SEARCH_INDEX } from "./src/config.js";
@@ -48,13 +49,19 @@ app.post("/api/ui-state", async (req, res) => {
 
 app.post("/api/search/query", async (req, res) => {
   try {
-    const query  = String(req.body?.query  ?? "").trim();
+    const rawQuery = String(req.body?.query  ?? "").trim();
     const index  = normalizeSearchIndex(req.body?.index);
     const limit  = Math.min(Math.max(Number(req.body?.limit  ?? 20), 1), 100);
     const offset = Math.max(Number(req.body?.offset ?? 0), 0);
     const filter = String(req.body?.filter ?? "");
     const sort   = Array.isArray(req.body?.sort)   ? req.body.sort   : [];
     const facets = Array.isArray(req.body?.facets) ? req.body.facets : DEFAULT_FACETS;
+    const model  = String(req.body?.model ?? DEFAULT_AGENT_MODEL).trim() || DEFAULT_AGENT_MODEL;
+
+    // Query rewriting: solo per frasi lunghe (≥4 parole)
+    const query = rawQuery.split(/\s+/).length >= 4
+      ? await rewriteQueryForSearch(rawQuery, model)
+      : rawQuery;
 
     const result = await searchDocuments({ query, index, limit, offset, filter, sort, facets });
     res.json(result);
@@ -107,14 +114,21 @@ app.post("/api/search-stream", async (req, res) => {
     const generateAnswer = req.body?.generateAnswer !== false;
     // Prompt personalizzato dall'admin (opzionale). Variabili: {{query}}, {{context}}
     const customSystemPrompt = String(req.body?.systemPrompt ?? "").trim();
+    // hits precaricati dal client (stessi della colonna risultati)
+    const preloadedHits = Array.isArray(req.body?.hits) ? req.body.hits : null;
 
     if (!query) {
       emit({ type: "error", error: "Query obbligatoria." });
       return res.end();
     }
 
-    // 1. Meilisearch — emette subito i risultati
-    const meiliResult = await searchDocuments({ query, index, limit, offset, filter, sort, facets });
+    // 1. Meilisearch — usa hits precaricati se disponibili (evita doppia ricerca)
+    let meiliResult;
+    if (preloadedHits) {
+      meiliResult = { hits: preloadedHits, estimatedTotalHits: preloadedHits.length, processingTimeMs: 0 };
+    } else {
+      meiliResult = await searchDocuments({ query, index, limit, offset, filter, sort, facets });
+    }
     emit({
       type: "hits",
       hits: meiliResult.hits ?? [],
